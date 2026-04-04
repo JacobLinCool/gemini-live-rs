@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live"
-version = "0.1.1"
+version = "0.1.2"
 description = "High-performance Rust client for the Gemini Multimodal Live API"
 readme = "../../README.md"
 edition.workspace = true
@@ -17,5 +17,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 
+rustls = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_path"
+harness = false

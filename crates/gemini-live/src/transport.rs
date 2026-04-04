@@ -104,6 +104,9 @@ pub struct Connection {
 impl Connection {
     /// Establish a WebSocket connection (does **not** send the `setup` message).
     pub async fn connect(config: &TransportConfig) -> Result<Self, ConnectError> {
+        // Ensure a rustls CryptoProvider is installed (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let url = build_url(config);
         let mut ws_config = WebSocketConfig::default();
         ws_config.write_buffer_size = config.write_buffer_size;
@@ -143,16 +146,19 @@ impl Connection {
     pub async fn recv(&mut self) -> Result<RawFrame, RecvError> {
         loop {
             match self.stream.next().await {
-                Some(Ok(msg)) => match msg {
-                    Message::Text(text) => return Ok(RawFrame::Text(text.to_string())),
-                    Message::Binary(data) => return Ok(RawFrame::Binary(data.to_vec())),
-                    Message::Close(frame) => {
-                        let reason = frame.map(|f| f.reason.to_string());
-                        return Ok(RawFrame::Close(reason));
+                Some(Ok(msg)) => {
+                    tracing::trace!(msg_type = ?std::mem::discriminant(&msg), "raw ws frame received");
+                    match msg {
+                        Message::Text(text) => return Ok(RawFrame::Text(text.to_string())),
+                        Message::Binary(data) => return Ok(RawFrame::Binary(data.to_vec())),
+                        Message::Close(frame) => {
+                            let reason = frame.map(|f| f.reason.to_string());
+                            return Ok(RawFrame::Close(reason));
+                        }
+                        // Ping/Pong are handled at the tungstenite protocol level.
+                        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                     }
-                    // Ping/Pong are handled at the tungstenite protocol level.
-                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
-                },
+                }
                 Some(Err(e)) => return Err(RecvError::Ws(e)),
                 None => return Err(RecvError::Closed),
             }

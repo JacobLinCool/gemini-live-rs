@@ -28,9 +28,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         setup: SetupConfig {
             model,
             generation_config: Some(GenerationConfig {
-                response_modalities: Some(vec![Modality::Text]),
+                response_modalities: Some(vec![Modality::Audio]),
                 ..Default::default()
             }),
+            output_audio_transcription: Some(AudioTranscriptionConfig {}),
             ..Default::default()
         },
         reconnect: ReconnectPolicy::default(),
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let printer = tokio::spawn(async move {
         while let Some(event) = recv.next_event().await {
             match event {
-                ServerEvent::ModelText(text) => {
+                ServerEvent::OutputTranscription(text) => {
                     print!("{text}");
                     std::io::stdout().flush().ok();
                 }

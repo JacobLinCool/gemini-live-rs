@@ -465,15 +465,16 @@ impl Runner {
                 frame = self.conn.recv() => {
                     match frame {
                         Ok(RawFrame::Text(text)) => {
-                            match codec::decode(&text) {
-                                Ok(msg) => {
-                                    if self.process_message(msg) {
-                                        return DisconnectReason::GoAway;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "failed to decode server message");
-                                }
+                            if let Some(reason) = self.try_decode_and_process(&text) {
+                                return reason;
+                            }
+                        }
+                        Ok(RawFrame::Binary(data)) => {
+                            // Gemini Live API may send JSON as binary frames.
+                            if let Ok(text) = std::str::from_utf8(&data)
+                                && let Some(reason) = self.try_decode_and_process(text)
+                            {
+                                return reason;
                             }
                         }
                         Ok(RawFrame::Close(reason)) => {
@@ -481,9 +482,6 @@ impl Runner {
                                 reason: reason.unwrap_or_default(),
                             });
                             return DisconnectReason::ConnectionLost;
-                        }
-                        Ok(RawFrame::Binary(_)) => {
-                            tracing::trace!("unexpected binary frame, ignoring");
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "recv error");
@@ -497,6 +495,24 @@ impl Runner {
 
     /// Decode a server message, track session state, and broadcast events.
     /// Returns `true` if the message contained a `goAway`.
+    /// Try to decode a JSON string and process it. Returns `Some(reason)` if
+    /// the connection loop should exit.
+    fn try_decode_and_process(&self, text: &str) -> Option<DisconnectReason> {
+        match codec::decode(text) {
+            Ok(msg) => {
+                if self.process_message(msg) {
+                    Some(DisconnectReason::GoAway)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode server message");
+                None
+            }
+        }
+    }
+
     fn process_message(&self, msg: ServerMessage) -> bool {
         // Track the latest resume handle for reconnection.
         if let Some(ref sr) = msg.session_resumption_update
@@ -571,6 +587,7 @@ async fn do_handshake(
     }
 
     let json = codec::encode(&ClientMessage::Setup(setup))?;
+    tracing::debug!(setup_json = %json, "sending setup message");
     conn.send_text(&json)
         .await
         .map_err(|e| SessionError::SetupFailed(e.to_string()))?;
@@ -584,13 +601,20 @@ async fn wait_setup_complete(conn: &mut Connection) -> Result<(), SessionError> 
     loop {
         match conn.recv().await {
             Ok(RawFrame::Text(text)) => {
-                let msg =
-                    codec::decode(&text).map_err(|e| SessionError::SetupFailed(e.to_string()))?;
-                if msg.setup_complete.is_some() {
-                    return Ok(());
+                tracing::debug!(raw = %text, "received text during setup");
+                match try_parse_setup_response(&text)? {
+                    SetupResult::Complete => return Ok(()),
+                    SetupResult::Continue => {}
                 }
-                if let Some(err) = msg.error {
-                    return Err(SessionError::Api(err.message));
+            }
+            Ok(RawFrame::Binary(data)) => {
+                // Gemini Live API may send JSON as binary frames.
+                if let Ok(text) = std::str::from_utf8(&data) {
+                    tracing::debug!(raw = %text, "received binary (UTF-8) during setup");
+                    match try_parse_setup_response(text)? {
+                        SetupResult::Complete => return Ok(()),
+                        SetupResult::Continue => {}
+                    }
                 }
             }
             Ok(RawFrame::Close(reason)) => {
@@ -599,10 +623,25 @@ async fn wait_setup_complete(conn: &mut Connection) -> Result<(), SessionError> 
                     reason.unwrap_or_default()
                 )));
             }
-            Ok(RawFrame::Binary(_)) => continue,
             Err(e) => return Err(SessionError::SetupFailed(e.to_string())),
         }
     }
+}
+
+enum SetupResult {
+    Complete,
+    Continue,
+}
+
+fn try_parse_setup_response(text: &str) -> Result<SetupResult, SessionError> {
+    let msg = codec::decode(text).map_err(|e| SessionError::SetupFailed(e.to_string()))?;
+    if msg.setup_complete.is_some() {
+        return Ok(SetupResult::Complete);
+    }
+    if let Some(err) = msg.error {
+        return Err(SessionError::Api(err.message));
+    }
+    Ok(SetupResult::Continue)
 }
 
 // ── Backoff ──────────────────────────────────────────────────────────────────

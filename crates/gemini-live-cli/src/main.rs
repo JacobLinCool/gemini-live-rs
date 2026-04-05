@@ -149,7 +149,7 @@ impl App {
         Self {
             messages: vec![Msg {
                 role: Role::System,
-                text: "connected — @file for media, /mic /speak to toggle audio".to_string(),
+                text: "connected — @file for media, /mic /speak to toggle audio, /share-screen to share screen".to_string(),
             }],
             pending: String::new(),
             input: String::new(),

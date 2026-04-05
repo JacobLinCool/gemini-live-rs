@@ -27,3 +27,7 @@ cpal = { version = "0.15", optional = true }
 webrtc-audio-processing = { version = "2.0", features = ["bundled"], optional = true }
 xcap = { version = "0.9", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
+
+[[bin]]
+name = "gemini-live"
+path = "src/main.rs"

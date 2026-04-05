@@ -39,12 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("update") => return update::run().await,
         Some("--version" | "-V") => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Some(arg) => {
             eprintln!("unknown command: {arg}");
-            eprintln!("usage: {} [update | --version]", env!("CARGO_PKG_NAME"));
+            eprintln!("usage: {} [update | --version]", env!("CARGO_BIN_NAME"));
             std::process::exit(1);
         }
         None => {}

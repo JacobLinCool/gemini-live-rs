@@ -5,7 +5,7 @@ use std::fs;
 use std::process::Command;
 
 const REPO: &str = "JacobLinCool/gemini-live-rs";
-const BIN_NAME: &str = "gemini-live-cli";
+const BIN_NAME: &str = "gemini-live";
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const TARGET: &str = "x86_64-unknown-linux-gnu";

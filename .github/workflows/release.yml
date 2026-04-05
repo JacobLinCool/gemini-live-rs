@@ -67,12 +67,12 @@ jobs:
       - name: Package
         run: |
           cd target/release
-          tar czf ../../gemini-live-cli-${{ matrix.target }}.tar.gz gemini-live-cli
+          tar czf ../../gemini-live-${{ matrix.target }}.tar.gz gemini-live
 
       - uses: actions/upload-artifact@v7
         with:
-          name: gemini-live-cli-${{ matrix.target }}
-          path: gemini-live-cli-${{ matrix.target }}.tar.gz
+          name: gemini-live-${{ matrix.target }}
+          path: gemini-live-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release
@@ -87,4 +87,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: gemini-live-cli-*.tar.gz
+          files: gemini-live-*.tar.gz

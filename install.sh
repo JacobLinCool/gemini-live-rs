@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="JacobLinCool/gemini-live-rs"
-BIN_NAME="gemini-live-cli"
+BIN_NAME="gemini-live"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 # Detect OS

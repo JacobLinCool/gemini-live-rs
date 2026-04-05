@@ -35,6 +35,49 @@ VERTEX_AUTH=adc \
 cargo run -p gemini-live-cli --features vertex-auth
 ```
 
+Select or create a named profile:
+
+```bash
+cargo run -p gemini-live-cli -- --profile work
+```
+
+Print the resolved config file path:
+
+```bash
+cargo run -p gemini-live-cli -- config
+```
+
+## Profiles & Config
+
+The CLI persists global configuration in:
+
+- `$XDG_CONFIG_HOME/gemini-live/config.toml`
+- or `~/.config/gemini-live/config.toml` when `XDG_CONFIG_HOME` is unset
+- or `%APPDATA%\\gemini-live\\config.toml` on Windows
+
+Profiles are keyed by name inside that file. If `--profile <name>` refers to a
+missing profile, the CLI creates it automatically and saves resolved settings
+into it.
+
+The selected profile persists:
+
+- backend selection and credentials
+- model
+- system instruction
+- enabled tools
+- microphone / speaker auto-start state
+- optional screen-share target and interval
+
+Startup precedence is:
+
+1. Environment variables
+2. Active profile values
+3. Built-in defaults
+
+Resolved startup settings are written back to the active profile, so exporting
+`GEMINI_API_KEY` or `GEMINI_MODEL` for one run is enough to seed a profile for
+later runs. This file may therefore contain plaintext credentials.
+
 ## Canonical Behavior
 
 The canonical description of the default CLI session profile now lives in the
@@ -90,6 +133,11 @@ spaces are not supported yet.
 | `/share-screen list` | List available capture targets (monitors and windows) with IDs. |
 | `/share-screen <id> [interval]` | Start sharing a monitor or window. `interval` is seconds between frames (default: 1). Example: `/share-screen 0 5` shares Display 1 every 5 seconds. |
 | `/share-screen` | Stop screen sharing (when active). |
+| `/system` | Show active vs staged system instruction. |
+| `/system show` | Show active vs staged system instruction. |
+| `/system set <text>` | Stage a new system instruction for the next applied session. Quote the text when it contains spaces you want preserved literally. |
+| `/system clear` | Stage removal of the system instruction. |
+| `/system apply` | Open a fresh Live session using the staged system instruction and staged tools. |
 | `/tools` | Show active vs staged tool profile. |
 | `/tools list` | List the known tools and their current state (`active`, `staged`, `off`). |
 | `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `list-files`, `read-file`, `run-command`. |
@@ -155,8 +203,13 @@ default profile and current tool behavior. This file is intentionally kept as
 an entry guide rather than the canonical home of runtime behavior.
 
 - Tool-profile changes are session-level and therefore require `/tools apply`.
+- System-instruction changes are also setup-level and therefore require
+  `/system apply`.
 - `/tools apply` currently starts a fresh session instead of resuming server
   conversation state.
 - Local tools are intentionally narrow: `read-file` only reads UTF-8 text,
   `list-files` stays inside the current workspace root, and `run-command`
   executes argv-only commands without a shell.
+- Screen-share startup uses the saved numeric target id. If monitor/window
+  ordering changes between runs, the saved target may no longer point at the
+  same surface.

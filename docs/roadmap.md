@@ -41,7 +41,7 @@ end-user application.
 
 | ID | Item | Description | Priority |
 |----|------|-------------|----------|
-| C-1 | Session profiles | Including model / voice / system-prompt configuration. | High |
+| C-1 | Richer session profiles | Persistent named profiles now cover backend, model, system instruction, credentials, tools, and device auto-start state. Extend them to first-class voice and richer session-template controls. | High |
 | C-2 | Tool-profile resumption and context carryover | The CLI now executes local function calls and can enable Google Search, but `/tools apply` still uses a fresh session. Add an explicit resume / carryover path so tool-profile changes do not drop server-side conversation state. | High |
 | C-3 | Runtime observability | Surface reconnecting, closed, lagged, and send-failure states in the TUI instead of swallowing `.ok()` results. | High |
 | C-4 | Distribution truthfulness | `update.rs` advertises Linux ARM64, but the release workflow does not ship that artifact. Align updater targets with published binaries. | Medium |

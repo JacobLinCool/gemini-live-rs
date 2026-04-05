@@ -24,13 +24,15 @@
 //!
 //! # Current Default Profile
 //!
-//! The CLI currently boots into a single opinionated voice-first profile:
+//! The CLI currently boots into a voice-first session template, then overlays
+//! settings from the selected persistent profile:
 //!
 //! - `responseModalities = ["AUDIO"]`
 //! - `inputAudioTranscription = {}`
 //! - `outputAudioTranscription = {}`
-//! - no tools enabled by default; `/tools apply` reconnects with the staged
-//!   tool profile
+//! - profile-selected model / backend / credentials
+//! - profile-selected tools, mic / speaker auto-start, and optional
+//!   screen-share auto-start
 //!
 //! This module doc is the canonical home for the default CLI session profile.
 //! Keep it in sync with the `SetupConfig` built in `main()`.
@@ -39,6 +41,7 @@
 mod audio_io;
 mod input;
 mod media;
+mod profile;
 #[cfg(feature = "share-screen")]
 mod screen;
 mod slash;
@@ -49,6 +52,7 @@ use std::collections::HashMap;
 use std::io;
 use std::{error::Error, fmt};
 
+use clap::{Parser, Subcommand};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
@@ -67,18 +71,29 @@ use gemini_live::types::*;
 
 const DEFAULT_GEMINI_MODEL: &str = "models/gemini-3.1-flash-live-preview";
 
+#[derive(Debug, Parser)]
+#[command(name = env!("CARGO_BIN_NAME"))]
+struct CliArgs {
+    #[arg(long)]
+    profile: Option<String>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Update,
+    Config,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match std::env::args().nth(1).as_deref() {
-        Some("update") => return update::run().await,
-        Some("--version" | "-V") => {
-            println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+    let cli = CliArgs::parse();
+    match cli.command {
+        Some(CliCommand::Update) => return update::run().await,
+        Some(CliCommand::Config) => {
+            println!("{}", profile::config_file_path()?.display());
             return Ok(());
-        }
-        Some(arg) => {
-            eprintln!("unknown command: {arg}");
-            eprintln!("usage: {} [update | --version]", env!("CARGO_BIN_NAME"));
-            std::process::exit(1);
         }
         None => {}
     }
@@ -90,11 +105,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(io::stderr)
         .init();
 
-    let startup = resolve_startup_config(|key| std::env::var(key).ok())?;
+    let mut profile_store = profile::ProfileStore::load(cli.profile.as_deref())?;
+    let startup = resolve_startup_config(
+        |key| std::env::var(key).ok(),
+        profile_store.active_profile(),
+        profile_store.active_profile_name(),
+    )?;
+    profile_store.persist_profile(startup.persisted_profile.clone())?;
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, startup).await;
+    let result = run(&mut terminal, startup, profile_store).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -130,10 +151,28 @@ enum VertexTransportAuthPlan {
 
 #[derive(Debug, Clone)]
 struct StartupConfig {
+    profile_name: String,
     model: String,
+    system_instruction: Option<String>,
     transport: TransportConfig,
     backend: Backend,
     location: Option<String>,
+    tool_profile: tooling::ToolProfile,
+    mic_enabled: bool,
+    speak_enabled: bool,
+    screen_share: profile::ScreenShareProfile,
+    persisted_profile: profile::ProfileConfig,
+}
+
+#[derive(Debug, Clone)]
+struct PersistedProfileInput {
+    backend: Backend,
+    model: String,
+    system_instruction: Option<String>,
+    tools: tooling::ToolProfile,
+    mic_enabled: bool,
+    speak_enabled: bool,
+    screen_share: profile::ScreenShareProfile,
 }
 
 impl StartupConfig {
@@ -165,8 +204,11 @@ impl Error for CliConfigError {}
 
 fn resolve_startup_config(
     env: impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
+    profile_name: &str,
 ) -> Result<StartupConfig, CliConfigError> {
-    let plan = resolve_transport_plan(&env)?;
+    let backend = parse_backend(&env, stored_profile)?;
+    let plan = resolve_transport_plan(&env, stored_profile, backend)?;
     let backend = match &plan {
         TransportPlan::Gemini { .. } => Backend::Gemini,
         TransportPlan::Vertex { .. } => Backend::Vertex,
@@ -175,29 +217,64 @@ fn resolve_startup_config(
         TransportPlan::Gemini { .. } => None,
         TransportPlan::Vertex { location, .. } => Some(location.clone()),
     };
-    let model = resolve_model(&env, backend)?;
+    let model = resolve_model(&env, stored_profile, backend)?;
+    let system_instruction = env("GEMINI_SYSTEM_INSTRUCTION")
+        .or_else(|| stored_profile.system_instruction.clone())
+        .filter(|value| !value.trim().is_empty());
     let transport = build_transport(plan)?;
+    let tool_profile = stored_profile.tools.unwrap_or_default();
+    let mic_enabled = stored_profile.mic_enabled.unwrap_or(false);
+    let speak_enabled = stored_profile.speak_enabled.unwrap_or(false);
+    let screen_share = stored_profile.screen_share.clone().unwrap_or_default();
+    let persisted_profile_input = PersistedProfileInput {
+        backend,
+        model: model.clone(),
+        system_instruction: system_instruction.clone(),
+        tools: tool_profile,
+        mic_enabled,
+        speak_enabled,
+        screen_share: screen_share.clone(),
+    };
+    let persisted_profile = build_persisted_profile(&persisted_profile_input, &transport);
 
     Ok(StartupConfig {
+        profile_name: profile_name.to_string(),
         model,
+        system_instruction,
         transport,
         backend,
         location,
+        tool_profile,
+        mic_enabled,
+        speak_enabled,
+        screen_share,
+        persisted_profile,
     })
 }
 
 fn resolve_transport_plan(
     env: &impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
+    backend: Backend,
 ) -> Result<TransportPlan, CliConfigError> {
-    match parse_backend(env)? {
+    match backend {
         Backend::Gemini => Ok(TransportPlan::Gemini {
-            api_key: required_env(env, "GEMINI_API_KEY")?,
+            api_key: required_setting(
+                env("GEMINI_API_KEY"),
+                stored_profile.gemini_api_key.clone(),
+                "GEMINI_API_KEY",
+            )?,
         }),
         Backend::Vertex => Ok(TransportPlan::Vertex {
-            location: required_env(env, "VERTEX_LOCATION")?,
-            auth: match parse_vertex_auth_mode(env)? {
-                VertexAuthMode::Static => VertexTransportAuthPlan::StaticToken(required_env(
-                    env,
+            location: required_setting(
+                env("VERTEX_LOCATION"),
+                stored_profile.vertex_location.clone(),
+                "VERTEX_LOCATION",
+            )?,
+            auth: match parse_vertex_auth_mode(env, stored_profile)? {
+                VertexAuthMode::Static => VertexTransportAuthPlan::StaticToken(required_setting(
+                    env("VERTEX_AI_ACCESS_TOKEN"),
+                    stored_profile.vertex_ai_access_token.clone(),
                     "VERTEX_AI_ACCESS_TOKEN",
                 )?),
                 VertexAuthMode::Adc => VertexTransportAuthPlan::Adc,
@@ -208,18 +285,28 @@ fn resolve_transport_plan(
 
 fn resolve_model(
     env: &impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
     backend: Backend,
 ) -> Result<String, CliConfigError> {
     match backend {
-        Backend::Gemini => Ok(env("GEMINI_MODEL").unwrap_or_else(|| DEFAULT_GEMINI_MODEL.into())),
-        Backend::Vertex => required_env(env, "VERTEX_MODEL"),
+        Backend::Gemini => Ok(env("GEMINI_MODEL")
+            .or_else(|| stored_profile.model.clone())
+            .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.into())),
+        Backend::Vertex => required_setting(
+            env("VERTEX_MODEL"),
+            stored_profile.model.clone(),
+            "VERTEX_MODEL",
+        ),
     }
 }
 
-fn parse_backend(env: &impl Fn(&str) -> Option<String>) -> Result<Backend, CliConfigError> {
+fn parse_backend(
+    env: &impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
+) -> Result<Backend, CliConfigError> {
     match env("LIVE_BACKEND")
-        .as_deref()
-        .unwrap_or("gemini")
+        .or_else(|| stored_profile.backend.map(persistent_backend_to_env))
+        .unwrap_or_else(|| "gemini".to_string())
         .trim()
         .to_ascii_lowercase()
         .as_str()
@@ -234,10 +321,15 @@ fn parse_backend(env: &impl Fn(&str) -> Option<String>) -> Result<Backend, CliCo
 
 fn parse_vertex_auth_mode(
     env: &impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
 ) -> Result<VertexAuthMode, CliConfigError> {
     match env("VERTEX_AUTH")
-        .as_deref()
-        .unwrap_or("static")
+        .or_else(|| {
+            stored_profile
+                .vertex_auth
+                .map(persistent_vertex_auth_to_env)
+        })
+        .unwrap_or_else(|| "static".to_string())
         .trim()
         .to_ascii_lowercase()
         .as_str()
@@ -250,13 +342,78 @@ fn parse_vertex_auth_mode(
     }
 }
 
-fn required_env(
-    env: &impl Fn(&str) -> Option<String>,
+fn required_setting(
+    primary: Option<String>,
+    secondary: Option<String>,
     key: &str,
 ) -> Result<String, CliConfigError> {
-    env(key)
+    primary
+        .or(secondary)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| CliConfigError::new(format!("set {key} environment variable")))
+        .ok_or_else(|| {
+            CliConfigError::new(format!(
+                "set {key} in the environment or the active profile"
+            ))
+        })
+}
+
+fn build_persisted_profile(
+    input: &PersistedProfileInput,
+    transport: &TransportConfig,
+) -> profile::ProfileConfig {
+    let (backend_value, gemini_api_key, vertex_location, vertex_auth, vertex_ai_access_token) =
+        match (input.backend, &transport.auth, &transport.endpoint) {
+            (Backend::Gemini, Auth::ApiKey(key), _) => (
+                Some(profile::PersistentBackend::Gemini),
+                Some(key.clone()),
+                None,
+                None,
+                None,
+            ),
+            (Backend::Vertex, Auth::BearerToken(token), Endpoint::VertexAi { location }) => (
+                Some(profile::PersistentBackend::Vertex),
+                None,
+                Some(location.clone()),
+                Some(profile::PersistentVertexAuthMode::Static),
+                Some(token.clone()),
+            ),
+            (Backend::Vertex, Auth::BearerTokenProvider(_), Endpoint::VertexAi { location }) => (
+                Some(profile::PersistentBackend::Vertex),
+                None,
+                Some(location.clone()),
+                Some(profile::PersistentVertexAuthMode::Adc),
+                None,
+            ),
+            _ => (None, None, None, None, None),
+        };
+
+    profile::ProfileConfig {
+        backend: backend_value,
+        model: Some(input.model.clone()),
+        system_instruction: input.system_instruction.clone(),
+        gemini_api_key,
+        vertex_location,
+        vertex_auth,
+        vertex_ai_access_token,
+        tools: Some(input.tools),
+        mic_enabled: Some(input.mic_enabled),
+        speak_enabled: Some(input.speak_enabled),
+        screen_share: Some(input.screen_share.clone()),
+    }
+}
+
+fn persistent_backend_to_env(value: profile::PersistentBackend) -> String {
+    match value {
+        profile::PersistentBackend::Gemini => "gemini".to_string(),
+        profile::PersistentBackend::Vertex => "vertex".to_string(),
+    }
+}
+
+fn persistent_vertex_auth_to_env(value: profile::PersistentVertexAuthMode) -> String {
+    match value {
+        profile::PersistentVertexAuthMode::Static => "static".to_string(),
+        profile::PersistentVertexAuthMode::Adc => "adc".to_string(),
+    }
 }
 
 fn build_transport(plan: TransportPlan) -> Result<TransportConfig, CliConfigError> {
@@ -300,6 +457,10 @@ mod startup_tests {
 
     use super::*;
 
+    fn empty_profile() -> profile::ProfileConfig {
+        profile::ProfileConfig::default()
+    }
+
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let vars = vars
             .iter()
@@ -309,40 +470,62 @@ mod startup_tests {
     }
 
     #[test]
+    fn cli_config_subcommand_parses() {
+        let cli = CliArgs::try_parse_from(["gemini-live", "config"]).expect("cli args");
+        assert!(matches!(cli.command, Some(CliCommand::Config)));
+    }
+
+    #[test]
     fn gemini_backend_defaults_model() {
-        let startup =
-            resolve_startup_config(env(&[("GEMINI_API_KEY", "test-key")])).expect("startup config");
+        let startup = resolve_startup_config(
+            env(&[("GEMINI_API_KEY", "test-key")]),
+            &empty_profile(),
+            "default",
+        )
+        .expect("startup config");
 
         assert_eq!(startup.model, DEFAULT_GEMINI_MODEL);
         assert_eq!(startup.backend, Backend::Gemini);
         assert!(startup.location.is_none());
+        assert_eq!(startup.profile_name, "default");
         assert!(matches!(startup.transport.endpoint, Endpoint::GeminiApi));
         assert!(matches!(startup.transport.auth, Auth::ApiKey(_)));
     }
 
     #[test]
     fn vertex_backend_requires_explicit_model() {
-        let err = resolve_startup_config(env(&[
-            ("LIVE_BACKEND", "vertex"),
-            ("VERTEX_LOCATION", "us-central1"),
-            ("VERTEX_AI_ACCESS_TOKEN", "token"),
-        ]))
+        let err = resolve_startup_config(
+            env(&[
+                ("LIVE_BACKEND", "vertex"),
+                ("VERTEX_LOCATION", "us-central1"),
+                ("VERTEX_AI_ACCESS_TOKEN", "token"),
+            ]),
+            &empty_profile(),
+            "default",
+        )
         .expect_err("missing model should fail");
 
-        assert_eq!(err.to_string(), "set VERTEX_MODEL environment variable");
+        assert_eq!(
+            err.to_string(),
+            "set VERTEX_MODEL in the environment or the active profile"
+        );
     }
 
     #[test]
     fn vertex_backend_static_token_path_builds_transport() {
-        let startup = resolve_startup_config(env(&[
-            ("LIVE_BACKEND", "vertex"),
-            ("VERTEX_LOCATION", "us-central1"),
-            (
-                "VERTEX_MODEL",
-                "projects/p/locations/us-central1/publishers/google/models/test",
-            ),
-            ("VERTEX_AI_ACCESS_TOKEN", "token"),
-        ]))
+        let startup = resolve_startup_config(
+            env(&[
+                ("LIVE_BACKEND", "vertex"),
+                ("VERTEX_LOCATION", "us-central1"),
+                (
+                    "VERTEX_MODEL",
+                    "projects/p/locations/us-central1/publishers/google/models/test",
+                ),
+                ("VERTEX_AI_ACCESS_TOKEN", "token"),
+            ]),
+            &empty_profile(),
+            "default",
+        )
         .expect("startup config");
 
         assert_eq!(startup.backend, Backend::Vertex);
@@ -356,10 +539,11 @@ mod startup_tests {
 
     #[test]
     fn unsupported_backend_is_rejected() {
-        let err = resolve_startup_config(env(&[
-            ("LIVE_BACKEND", "other"),
-            ("GEMINI_API_KEY", "test-key"),
-        ]))
+        let err = resolve_startup_config(
+            env(&[("LIVE_BACKEND", "other"), ("GEMINI_API_KEY", "test-key")]),
+            &empty_profile(),
+            "default",
+        )
         .expect_err("unsupported backend should fail");
 
         assert!(err.to_string().contains("unsupported LIVE_BACKEND"));
@@ -368,21 +552,86 @@ mod startup_tests {
     #[cfg(not(feature = "vertex-auth"))]
     #[test]
     fn vertex_adc_requires_feature() {
-        let err = resolve_startup_config(env(&[
-            ("LIVE_BACKEND", "vertex"),
-            ("VERTEX_LOCATION", "us-central1"),
-            (
-                "VERTEX_MODEL",
-                "projects/p/locations/us-central1/publishers/google/models/test",
-            ),
-            ("VERTEX_AUTH", "adc"),
-        ]))
+        let err = resolve_startup_config(
+            env(&[
+                ("LIVE_BACKEND", "vertex"),
+                ("VERTEX_LOCATION", "us-central1"),
+                (
+                    "VERTEX_MODEL",
+                    "projects/p/locations/us-central1/publishers/google/models/test",
+                ),
+                ("VERTEX_AUTH", "adc"),
+            ]),
+            &empty_profile(),
+            "default",
+        )
         .expect_err("adc should require feature");
 
         assert_eq!(
             err.to_string(),
             "VERTEX_AUTH=adc requires building gemini-live-cli with --features vertex-auth"
         );
+    }
+
+    #[test]
+    fn startup_uses_profile_values_when_env_is_missing() {
+        let stored = profile::ProfileConfig {
+            backend: Some(profile::PersistentBackend::Gemini),
+            model: Some("models/custom-live".into()),
+            system_instruction: Some("Profile instruction".into()),
+            gemini_api_key: Some("profile-key".into()),
+            tools: Some(tooling::ToolProfile {
+                read_file: true,
+                ..tooling::ToolProfile::default()
+            }),
+            mic_enabled: Some(true),
+            speak_enabled: Some(false),
+            ..Default::default()
+        };
+
+        let startup =
+            resolve_startup_config(env(&[]), &stored, "persisted").expect("startup config");
+        assert_eq!(startup.model, "models/custom-live");
+        assert_eq!(startup.profile_name, "persisted");
+        assert_eq!(
+            startup.system_instruction.as_deref(),
+            Some("Profile instruction")
+        );
+        assert!(startup.tool_profile.read_file);
+        assert!(startup.mic_enabled);
+        assert!(matches!(startup.transport.auth, Auth::ApiKey(_)));
+    }
+
+    #[test]
+    fn env_overrides_profile_values() {
+        let stored = profile::ProfileConfig {
+            backend: Some(profile::PersistentBackend::Gemini),
+            model: Some("models/from-profile".into()),
+            system_instruction: Some("Profile instruction".into()),
+            gemini_api_key: Some("profile-key".into()),
+            ..Default::default()
+        };
+
+        let startup = resolve_startup_config(
+            env(&[
+                ("GEMINI_MODEL", "models/from-env"),
+                ("GEMINI_SYSTEM_INSTRUCTION", "Env instruction"),
+                ("GEMINI_API_KEY", "env-key"),
+            ]),
+            &stored,
+            "default",
+        )
+        .expect("startup config");
+
+        assert_eq!(startup.model, "models/from-env");
+        assert_eq!(
+            startup.system_instruction.as_deref(),
+            Some("Env instruction")
+        );
+        match startup.transport.auth {
+            Auth::ApiKey(key) => assert_eq!(key, "env-key"),
+            other => panic!("unexpected auth: {other:?}"),
+        }
     }
 }
 
@@ -425,6 +674,8 @@ struct App {
     title: String,
     active_tools: tooling::ToolProfile,
     desired_tools: tooling::ToolProfile,
+    active_system_instruction: Option<String>,
+    desired_system_instruction: Option<String>,
     #[cfg(feature = "mic")]
     mic_on: bool,
     #[cfg(feature = "speak")]
@@ -459,7 +710,7 @@ enum AppEvent {
 }
 
 impl App {
-    fn new(title: &str, tools: tooling::ToolProfile) -> Self {
+    fn new(title: &str, tools: tooling::ToolProfile, system_instruction: Option<String>) -> Self {
         Self {
             messages: vec![Msg {
                 role: Role::System,
@@ -473,6 +724,8 @@ impl App {
             title: title.to_string(),
             active_tools: tools,
             desired_tools: tools,
+            active_system_instruction: system_instruction.clone(),
+            desired_system_instruction: system_instruction,
             #[cfg(feature = "mic")]
             mic_on: false,
             #[cfg(feature = "speak")]
@@ -540,6 +793,7 @@ impl App {
 async fn connect_session(
     startup: &StartupConfig,
     tools: tooling::ToolProfile,
+    system_instruction: Option<&str>,
 ) -> Result<Session, gemini_live::SessionError> {
     Session::connect(SessionConfig {
         transport: startup.transport.clone(),
@@ -551,6 +805,7 @@ async fn connect_session(
                 media_resolution: Some(MediaResolution::MediaResolutionHigh),
                 ..Default::default()
             }),
+            system_instruction: system_instruction.map(system_instruction_content),
             input_audio_transcription: Some(AudioTranscriptionConfig {}),
             output_audio_transcription: Some(AudioTranscriptionConfig {}),
             tools: tools.build_live_tools(),
@@ -559,6 +814,16 @@ async fn connect_session(
         reconnect: ReconnectPolicy::default(),
     })
     .await
+}
+
+fn system_instruction_content(text: &str) -> Content {
+    Content {
+        role: None,
+        parts: vec![Part {
+            text: Some(text.to_string()),
+            inline_data: None,
+        }],
+    }
 }
 
 fn spawn_session_forwarder(
@@ -605,19 +870,93 @@ fn cancel_pending_tools(pending: &mut HashMap<String, JoinHandle<()>>) {
     }
 }
 
+fn persist_audio_state(store: &mut profile::ProfileStore, app: &App) -> io::Result<()> {
+    store.set_audio_state(
+        {
+            #[cfg(feature = "mic")]
+            {
+                app.mic_on
+            }
+            #[cfg(not(feature = "mic"))]
+            {
+                false
+            }
+        },
+        {
+            #[cfg(feature = "speak")]
+            {
+                app.speak_on
+            }
+            #[cfg(not(feature = "speak"))]
+            {
+                false
+            }
+        },
+    )
+}
+
+fn summarize_optional_system_instruction(text: Option<&str>) -> String {
+    match text {
+        Some(text) => summarize_system_instruction(text),
+        None => "none".into(),
+    }
+}
+
+fn summarize_system_instruction(text: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        compact
+    } else {
+        let summary = compact.chars().take(MAX_CHARS).collect::<String>();
+        format!("{summary}...")
+    }
+}
+
+#[cfg(feature = "share-screen")]
+#[derive(Debug, Clone, Copy, Default)]
+struct ScreenShareState {
+    target_id: Option<usize>,
+    interval_secs: Option<f64>,
+}
+
+#[cfg(feature = "share-screen")]
+fn persist_screen_state(
+    store: &mut profile::ProfileStore,
+    app: &App,
+    state: ScreenShareState,
+) -> io::Result<()> {
+    store.set_screen_share(app.screen_on, state.target_id, state.interval_secs)
+}
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     startup: StartupConfig,
+    mut profile_store: profile::ProfileStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir()?;
-    let mut app = App::new(&startup.connection_label(), tooling::ToolProfile::default());
+    let mut app = App::new(
+        &startup.connection_label(),
+        startup.tool_profile,
+        startup.system_instruction.clone(),
+    );
     app.refresh_completions();
     let mut tool_runtime = tooling::ToolRuntime::new(workspace_root.clone(), app.active_tools)?;
 
+    app.sys(format!("profile: {}", startup.profile_name));
     app.sys(format!("tools active: {}", app.active_tools.summary()));
-    let mut session = connect_session(&startup, app.active_tools).await?;
+    app.sys(format!(
+        "system instruction active: {}",
+        summarize_optional_system_instruction(app.active_system_instruction.as_deref())
+    ));
+    let mut session = connect_session(
+        &startup,
+        app.active_tools,
+        app.active_system_instruction.as_deref(),
+    )
+    .await?;
 
     // Session / tool events → channel
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
@@ -647,6 +986,33 @@ async fn run(
 
     let mut term_events = EventStream::new();
 
+    #[cfg(feature = "speak")]
+    if startup.speak_enabled {
+        toggle_speaker(&mut app, &mut speaker, &aec);
+        persist_audio_state(&mut profile_store, &app)?;
+    }
+
+    #[cfg(feature = "mic")]
+    if startup.mic_enabled {
+        toggle_mic(&mut app, &mut mic, &mic_tx, &aec, &session).await;
+        persist_audio_state(&mut profile_store, &app)?;
+    }
+
+    #[cfg(feature = "share-screen")]
+    if startup.screen_share.enabled == Some(true) {
+        if let Some(target_id) = startup.screen_share.target_id {
+            let interval = startup.screen_share.interval_secs.unwrap_or(1.0);
+            let args = format!("{target_id} {interval}");
+            let screen_state = handle_share_screen(&mut app, &mut screen_share, &screen_tx, &args);
+            persist_screen_state(&mut profile_store, &app, screen_state)?;
+        } else {
+            app.sys(
+                "screen share profile requested auto-start, but no target id is configured".into(),
+            );
+            profile_store.set_screen_share(false, None, startup.screen_share.interval_secs)?;
+        }
+    }
+
     loop {
         terminal.draw(|f| render(f, &mut app))?;
         if app.quit {
@@ -658,18 +1024,38 @@ async fn run(
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
                 {
+                    let previous_desired_tools = app.desired_tools;
+                    let previous_desired_system_instruction =
+                        app.desired_system_instruction.clone();
                     match handle_key(&mut app, key, &session).await? {
                         #[cfg(feature = "mic")]
-                        Some(Cmd::ToggleMic) => toggle_mic(&mut app, &mut mic, &mic_tx, &aec, &session).await,
+                        Some(Cmd::ToggleMic) => {
+                            toggle_mic(&mut app, &mut mic, &mic_tx, &aec, &session).await;
+                            persist_audio_state(&mut profile_store, &app)?;
+                        }
                         #[cfg(feature = "speak")]
-                        Some(Cmd::ToggleSpeaker) => toggle_speaker(&mut app, &mut speaker, &aec),
+                        Some(Cmd::ToggleSpeaker) => {
+                            toggle_speaker(&mut app, &mut speaker, &aec);
+                            persist_audio_state(&mut profile_store, &app)?;
+                        }
                         #[cfg(feature = "share-screen")]
-                        Some(Cmd::ShareScreen(args)) => handle_share_screen(&mut app, &mut screen_share, &screen_tx, &args),
-                        Some(Cmd::ApplyTools) => {
-                            if app.active_tools == app.desired_tools {
-                                app.sys("tool profile already active".into());
+                        Some(Cmd::ShareScreen(args)) => {
+                            let state = handle_share_screen(&mut app, &mut screen_share, &screen_tx, &args);
+                            persist_screen_state(&mut profile_store, &app, state)?;
+                        }
+                        Some(Cmd::ApplySessionConfig) => {
+                            if app.active_tools == app.desired_tools
+                                && app.active_system_instruction == app.desired_system_instruction
+                            {
+                                app.sys("session config already active".into());
                             } else {
-                                match connect_session(&startup, app.desired_tools).await {
+                                match connect_session(
+                                    &startup,
+                                    app.desired_tools,
+                                    app.desired_system_instruction.as_deref(),
+                                )
+                                .await
+                                {
                                     Ok(new_session) => {
                                         generation += 1;
                                         let new_generation = generation;
@@ -683,15 +1069,28 @@ async fn run(
                                         let old_session = std::mem::replace(&mut session, new_session);
                                         session_task = new_task;
                                         app.active_tools = app.desired_tools;
+                                        app.active_system_instruction =
+                                            app.desired_system_instruction.clone();
                                         tool_runtime = tooling::ToolRuntime::new(
                                             workspace_root.clone(),
                                             app.active_tools,
                                         )?;
+                                        profile_store.set_tool_profile(app.active_tools)?;
+                                        profile_store.set_system_instruction(
+                                            app.active_system_instruction.clone(),
+                                        )?;
                                         old_session.close().await.ok();
-                                        app.sys(format!(
-                                            "reconnected with tools: {}",
-                                            app.active_tools.summary()
-                                        ));
+                                        app.sys(format!("reconnected with tools: {}", app.active_tools.summary()));
+                                        if let Some(system_instruction) =
+                                            app.active_system_instruction.as_deref()
+                                        {
+                                            app.sys(format!(
+                                                "system instruction active: {}",
+                                                summarize_system_instruction(system_instruction)
+                                            ));
+                                        } else {
+                                            app.sys("system instruction active: none".into());
+                                        }
                                     }
                                     Err(e) => {
                                         app.sys(format!("failed to apply staged tools: {e}"));
@@ -700,6 +1099,13 @@ async fn run(
                             }
                         }
                         None => {}
+                    }
+                    if app.desired_tools != previous_desired_tools {
+                        profile_store.set_tool_profile(app.desired_tools)?;
+                    }
+                    if app.desired_system_instruction != previous_desired_system_instruction {
+                        profile_store
+                            .set_system_instruction(app.desired_system_instruction.clone())?;
                     }
                 }
             }
@@ -783,7 +1189,7 @@ enum Cmd {
     ToggleSpeaker,
     #[cfg(feature = "share-screen")]
     ShareScreen(String),
-    ApplyTools,
+    ApplySessionConfig,
 }
 
 async fn handle_key(
@@ -847,7 +1253,48 @@ async fn handle_key(
                         ));
                     }
                     Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Apply)) => {
-                        return Ok(Some(Cmd::ApplyTools));
+                        return Ok(Some(Cmd::ApplySessionConfig));
+                    }
+                    Ok(slash::SlashCommand::System(slash::SystemCommand::Show)) => {
+                        app.sys(format!(
+                            "system instruction active: {}",
+                            summarize_optional_system_instruction(
+                                app.active_system_instruction.as_deref()
+                            )
+                        ));
+                        if app.active_system_instruction != app.desired_system_instruction {
+                            app.sys(format!(
+                                "system instruction staged: {}",
+                                summarize_optional_system_instruction(
+                                    app.desired_system_instruction.as_deref()
+                                )
+                            ));
+                            app.sys("run `/system apply` to reconnect with the staged system instruction".into());
+                        } else {
+                            app.sys("system instruction staged: none".into());
+                        }
+                    }
+                    Ok(slash::SlashCommand::System(slash::SystemCommand::Set(text))) => {
+                        let normalized = text.trim().to_string();
+                        if normalized.is_empty() {
+                            app.sys("[system] system instruction cannot be empty; use `/system clear` instead".into());
+                        } else {
+                            app.desired_system_instruction = Some(normalized.clone());
+                            app.sys(format!(
+                                "staged system instruction: {} (run `/system apply` to reconnect)",
+                                summarize_system_instruction(&normalized)
+                            ));
+                        }
+                    }
+                    Ok(slash::SlashCommand::System(slash::SystemCommand::Clear)) => {
+                        app.desired_system_instruction = None;
+                        app.sys(
+                            "staged system instruction clear (run `/system apply` to reconnect)"
+                                .into(),
+                        );
+                    }
+                    Ok(slash::SlashCommand::System(slash::SystemCommand::Apply)) => {
+                        return Ok(Some(Cmd::ApplySessionConfig));
                     }
                     Err(err) => app.sys(format!("[slash] {err}")),
                 }
@@ -936,7 +1383,7 @@ fn handle_share_screen(
     share: &mut Option<screen::ScreenShare>,
     tx: &mpsc::Sender<Vec<u8>>,
     args: &str,
-) {
+) -> ScreenShareState {
     // "/share-screen list"
     if args == "list" {
         let targets = screen::list();
@@ -950,7 +1397,7 @@ fn handle_share_screen(
                 ));
             }
         }
-        return;
+        return ScreenShareState::default();
     }
 
     // "/share-screen" (no args) — stop if active
@@ -962,7 +1409,7 @@ fn handle_share_screen(
         } else {
             app.sys("usage: /share-screen list | /share-screen <id> [interval_secs]".into());
         }
-        return;
+        return ScreenShareState::default();
     }
 
     // "/share-screen <id> [interval]" — stop any active, start new
@@ -971,7 +1418,7 @@ fn handle_share_screen(
         Some(id) => id,
         None => {
             app.sys("invalid id — use /share-screen list".into());
-            return;
+            return ScreenShareState::default();
         }
     };
     let interval_secs: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
@@ -988,10 +1435,18 @@ fn handle_share_screen(
             ));
             app.screen_on = true;
             *share = Some(s);
+            ScreenShareState {
+                target_id: Some(id),
+                interval_secs: Some(interval_secs),
+            }
         }
         Err(e) => {
             app.screen_on = false;
             app.sys(format!("screen share failed: {e}"));
+            ScreenShareState {
+                target_id: Some(id),
+                interval_secs: Some(interval_secs),
+            }
         }
     }
 }

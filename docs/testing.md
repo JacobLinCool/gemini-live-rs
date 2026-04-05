@@ -13,11 +13,11 @@
 | **Unit** | ReconnectPolicy: backoff calculation | 1 |
 | **Unit** | Session: status encoding, resume handle tracking | 3 |
 | **Unit** | Transport: URL construction, default config | 4 |
-| **Unit** | CLI: startup config + slash parser/completion + tool catalog | 11 |
+| **Unit** | CLI: startup config + top-level CLI parsing + slash parser/completion + tool catalog | 16 |
 | **Doc** | `lib.rs` usage example, `AudioEncoder` example | 4 |
 | **Bench** | Criterion hot-path suite (`cargo bench -p gemini-live`) | 1 |
 
-**Total: 45 library unit + 11 CLI unit + 4 doc tests + 1 benchmark suite**
+**Total: 45 library unit + 16 CLI unit + 4 doc tests + 1 benchmark suite**
 
 ## Running Tests
 

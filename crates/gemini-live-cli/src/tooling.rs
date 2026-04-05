@@ -17,6 +17,7 @@ use std::time::Duration;
 use gemini_live::types::{
     FunctionCallRequest, FunctionDeclaration, FunctionResponse, GoogleSearchTool, Tool,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -81,7 +82,8 @@ impl ToolId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolProfile {
     pub google_search: bool,
     pub list_files: bool,

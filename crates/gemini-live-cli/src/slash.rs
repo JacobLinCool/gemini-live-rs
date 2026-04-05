@@ -19,6 +19,15 @@ pub enum SlashCommand {
     #[cfg(feature = "share-screen")]
     ShareScreen(String),
     Tools(ToolsCommand),
+    System(SystemCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemCommand {
+    Show,
+    Set(String),
+    Clear,
+    Apply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +53,9 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     argv[0] = argv[0].trim_start_matches('/').to_string();
 
     Some(
-        CliSlashCommand::try_parse_from(
-            std::iter::once("slash".to_string()).chain(argv.into_iter()),
-        )
-        .map(Into::into)
-        .map_err(|e| e.to_string().trim().to_string()),
+        CliSlashCommand::try_parse_from(std::iter::once("slash".to_string()).chain(argv))
+            .map(Into::into)
+            .map_err(|e| e.to_string().trim().to_string()),
     )
 }
 
@@ -84,6 +91,13 @@ pub fn completions(input: &str) -> Vec<CompletionItem> {
     match normalized {
         #[cfg(feature = "share-screen")]
         "share-screen" => share_screen_completions(
+            parts.as_slice(),
+            trailing_space,
+            current_fragment,
+            current_range,
+            input.len(),
+        ),
+        "system" => system_completions(
             parts.as_slice(),
             trailing_space,
             current_fragment,
@@ -126,6 +140,11 @@ enum CliCommand {
         target: Option<String>,
         interval_secs: Option<f64>,
     },
+    #[command(name = "system")]
+    System {
+        #[command(subcommand)]
+        action: Option<CliSystemCommand>,
+    },
     #[command(name = "tools")]
     Tools {
         #[command(subcommand)]
@@ -140,6 +159,14 @@ enum CliToolsCommand {
     Enable { tool: CliToolArg },
     Disable { tool: CliToolArg },
     Toggle { tool: CliToolArg },
+    Apply,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliSystemCommand {
+    Show,
+    Set { text: Vec<String> },
+    Clear,
     Apply,
 }
 
@@ -182,6 +209,12 @@ impl From<CliSlashCommand> for SlashCommand {
                 };
                 Self::ShareScreen(args)
             }
+            CliCommand::System { action } => Self::System(match action {
+                None | Some(CliSystemCommand::Show) => SystemCommand::Show,
+                Some(CliSystemCommand::Set { text }) => SystemCommand::Set(text.join(" ")),
+                Some(CliSystemCommand::Clear) => SystemCommand::Clear,
+                Some(CliSystemCommand::Apply) => SystemCommand::Apply,
+            }),
             CliCommand::Tools { action } => Self::Tools(match action {
                 None | Some(CliToolsCommand::Status) => ToolsCommand::Status,
                 Some(CliToolsCommand::List) => ToolsCommand::List,
@@ -217,27 +250,31 @@ struct SubcommandSpec {
 }
 
 fn command_specs() -> Vec<CommandSpec> {
-    let mut specs = Vec::new();
-    #[cfg(feature = "mic")]
-    specs.push(CommandSpec {
-        name: "/mic",
-        detail: "toggle microphone streaming",
-    });
-    #[cfg(feature = "speak")]
-    specs.push(CommandSpec {
-        name: "/speak",
-        detail: "toggle speaker playback",
-    });
-    #[cfg(feature = "share-screen")]
-    specs.push(CommandSpec {
-        name: "/share-screen",
-        detail: "list, start, or stop screen sharing",
-    });
-    specs.push(CommandSpec {
-        name: "/tools",
-        detail: "inspect and stage the Live tool profile",
-    });
-    specs
+    vec![
+        #[cfg(feature = "mic")]
+        CommandSpec {
+            name: "/mic",
+            detail: "toggle microphone streaming",
+        },
+        #[cfg(feature = "speak")]
+        CommandSpec {
+            name: "/speak",
+            detail: "toggle speaker playback",
+        },
+        #[cfg(feature = "share-screen")]
+        CommandSpec {
+            name: "/share-screen",
+            detail: "list, start, or stop screen sharing",
+        },
+        CommandSpec {
+            name: "/tools",
+            detail: "inspect and stage the Live tool profile",
+        },
+        CommandSpec {
+            name: "/system",
+            detail: "inspect and stage the system instruction",
+        },
+    ]
 }
 
 fn tool_subcommand_specs() -> [SubcommandSpec; 6] {
@@ -275,6 +312,31 @@ fn tool_subcommand_specs() -> [SubcommandSpec; 6] {
     ]
 }
 
+fn system_subcommand_specs() -> [SubcommandSpec; 4] {
+    [
+        SubcommandSpec {
+            name: "show",
+            detail: "show active and staged system instruction",
+            expects_more: false,
+        },
+        SubcommandSpec {
+            name: "set",
+            detail: "stage a new system instruction",
+            expects_more: true,
+        },
+        SubcommandSpec {
+            name: "clear",
+            detail: "stage removal of the system instruction",
+            expects_more: false,
+        },
+        SubcommandSpec {
+            name: "apply",
+            detail: "reconnect with the staged system instruction",
+            expects_more: false,
+        },
+    ]
+}
+
 fn command_completions(
     prefix: &str,
     replace_range: Range<usize>,
@@ -305,11 +367,7 @@ fn share_screen_completions(
     input_len: usize,
 ) -> Vec<CompletionItem> {
     if parts.len() == 1 {
-        let replace_range = if trailing_space {
-            input_len..input_len
-        } else {
-            input_len..input_len
-        };
+        let replace_range = input_len..input_len;
         return vec![CompletionItem {
             label: "list".into(),
             replacement: " list".into(),
@@ -371,6 +429,42 @@ fn tools_completions(
         if parts.len() == 3 && !trailing_space {
             return tool_name_completions(current_fragment, current_range);
         }
+    }
+
+    Vec::new()
+}
+
+fn system_completions(
+    parts: &[&str],
+    trailing_space: bool,
+    current_fragment: &str,
+    current_range: Range<usize>,
+    input_len: usize,
+) -> Vec<CompletionItem> {
+    if parts.len() == 1 {
+        let replace_range = input_len..input_len;
+        return system_subcommand_specs()
+            .into_iter()
+            .map(|spec| CompletionItem {
+                label: spec.name.into(),
+                replacement: format!(" {}", spec.name_with_suffix()),
+                replace_range: replace_range.clone(),
+                detail: spec.detail.into(),
+            })
+            .collect();
+    }
+
+    if parts.len() == 2 && !trailing_space {
+        return system_subcommand_specs()
+            .into_iter()
+            .filter(|spec| spec.name.starts_with(current_fragment))
+            .map(|spec| CompletionItem {
+                label: spec.name.into(),
+                replacement: spec.name_with_suffix().into(),
+                replace_range: current_range.clone(),
+                detail: spec.detail.into(),
+            })
+            .collect();
     }
 
     Vec::new()
@@ -438,6 +532,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_system_set() {
+        let command = parse("/system set You are concise")
+            .expect("slash command")
+            .expect("valid command");
+        assert_eq!(
+            command,
+            SlashCommand::System(SystemCommand::Set("You are concise".into()))
+        );
+    }
+
+    #[test]
     fn complete_partial_command_name() {
         let items = completions("/to");
         assert!(items.iter().any(|item| item.label == "/tools"));
@@ -447,5 +552,12 @@ mod tests {
     fn complete_tool_name_after_enable() {
         let items = completions("/tools enable rea");
         assert!(items.iter().any(|item| item.label == "read-file"));
+    }
+
+    #[test]
+    fn complete_system_subcommand() {
+        let items = completions("/system s");
+        assert!(items.iter().any(|item| item.label == "set"));
+        assert!(items.iter().any(|item| item.label == "show"));
     }
 }

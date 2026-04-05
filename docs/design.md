@@ -103,3 +103,23 @@ session-resumption surgery. The public API reference says configuration changes
 are possible during pause/resume, but the crate does not yet expose a precise,
 caller-controlled resume flow. Until that exists, the CLI prefers a simple,
 explicit reconnect over a half-specified hidden transition.
+
+### ADR-7: CLI user preferences live in a global named-profile store
+
+The CLI now persists user-facing configuration in a global TOML file keyed by
+profile name. A profile captures:
+
+- backend selection and credentials
+- model selection
+- system instruction
+- staged tool profile
+- microphone / speaker auto-start flags
+- optional screen-share startup settings
+
+Startup resolution is `environment > active profile > built-in defaults`. The
+resolved values are then written back to the active profile so one explicit run
+can seed future launches.
+
+This design keeps startup deterministic and easy to explain: the active
+profile is the durable source of truth, while environment variables remain a
+simple override layer for automation or one-off launches.

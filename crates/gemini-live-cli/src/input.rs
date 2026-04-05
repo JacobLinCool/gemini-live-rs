@@ -68,7 +68,7 @@ impl InputEditor {
 }
 
 fn new_textarea(text: &str) -> TextArea<'static> {
-    let mut textarea = TextArea::from([text.replace(&['\n', '\r'], " ")]);
+    let mut textarea = TextArea::from([text.replace(['\n', '\r'], " ")]);
     textarea.set_cursor_line_style(Style::default());
     textarea.set_block(Block::default().borders(Borders::ALL));
     textarea.move_cursor(CursorMove::End);

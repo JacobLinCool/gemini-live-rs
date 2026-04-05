@@ -97,11 +97,17 @@ spaces are not supported yet.
 | `/tools toggle <tool>` | Flip a tool in the staged profile. |
 | `/tools apply` | Open a fresh Live session using the staged tool profile. |
 
+When the input starts with `/`, the CLI shows slash-command completions in a
+popup above the input box. `Tab` accepts the selected completion and `Up` /
+`Down` switch the highlighted suggestion.
+
 ### Keyboard
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Send input / execute command |
+| `Tab` | Accept the highlighted slash-command completion |
+| `Up` / `Down` | Move the slash-command completion selection (when visible) |
 | `Backspace` | Delete last character |
 | `Esc` / `Ctrl-C` / `Ctrl-D` | Quit |
 
@@ -126,6 +132,8 @@ cargo build -p gemini-live-cli --no-default-features
 
 ```
 main.rs      TUI event loop (crossterm + ratatui), command dispatch
+input.rs     Single-line editor wrapper built on `tui-textarea`
+slash.rs     Structured slash-command parsing (`clap`) + completion model
 media.rs     @file loading: image/audio detection, WAV decoding, mono mixdown
 audio_io.rs  cpal mic capture + speaker playback (gated by mic/speak features)
 screen.rs    xcap screen capture thread + JPEG encoding (gated by share-screen)

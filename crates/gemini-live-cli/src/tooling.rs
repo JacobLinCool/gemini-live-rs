@@ -79,17 +79,6 @@ impl ToolId {
             Self::RunCommand => Some("run_command"),
         }
     }
-
-    fn from_token(token: &str) -> Option<Self> {
-        match token.trim().to_ascii_lowercase().as_str() {
-            "google-search" | "google_search" | "search" => Some(Self::GoogleSearch),
-            "list-files" | "list_files" | "list" => Some(Self::ListFiles),
-            "read-file" | "read_file" | "read" => Some(Self::ReadFile),
-            "run-command" | "run_command" | "command" | "terminal" | "run-terminal"
-            | "run_terminal" => Some(Self::RunCommand),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -165,6 +154,7 @@ impl ToolProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolsCommand {
     Status,
     List,
@@ -172,65 +162,6 @@ pub enum ToolsCommand {
     Disable(ToolId),
     Toggle(ToolId),
     Apply,
-}
-
-pub fn parse_tools_command(input: &str) -> Option<Result<ToolsCommand, String>> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with("/tools") {
-        return None;
-    }
-
-    let mut parts = trimmed.split_whitespace();
-    let _tools = parts.next();
-    let command = match parts.next() {
-        None => return Some(Ok(ToolsCommand::Status)),
-        Some("status") => return Some(Ok(ToolsCommand::Status)),
-        Some("list") => return Some(Ok(ToolsCommand::List)),
-        Some("apply") => return Some(Ok(ToolsCommand::Apply)),
-        Some("enable") => "enable",
-        Some("disable") => "disable",
-        Some("toggle") => "toggle",
-        Some(other) => {
-            return Some(Err(format!(
-                "unknown `/tools` subcommand `{other}`; expected status, list, enable, disable, toggle, or apply"
-            )));
-        }
-    };
-
-    let Some(tool_name) = parts.next() else {
-        return Some(Err(format!(
-            "`/tools {command}` requires a tool name ({})",
-            ToolId::ALL
-                .into_iter()
-                .map(ToolId::key)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    };
-
-    if parts.next().is_some() {
-        return Some(Err(format!(
-            "`/tools {command}` accepts exactly one tool name"
-        )));
-    }
-
-    let Some(tool) = ToolId::from_token(tool_name) else {
-        return Some(Err(format!(
-            "unknown tool `{tool_name}`; expected one of {}",
-            ToolId::ALL
-                .into_iter()
-                .map(ToolId::key)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    };
-
-    Some(Ok(match command {
-        "enable" => ToolsCommand::Enable(tool),
-        "disable" => ToolsCommand::Disable(tool),
-        "toggle" => ToolsCommand::Toggle(tool),
-        _ => unreachable!("validated above"),
-    }))
 }
 
 pub fn status_lines(active: ToolProfile, desired: ToolProfile) -> Vec<String> {
@@ -783,25 +714,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_tools_defaults_to_status() {
-        let command = parse_tools_command("/tools")
-            .expect("tools command")
-            .expect("valid command");
-        assert!(matches!(command, ToolsCommand::Status));
-    }
-
-    #[test]
-    fn parse_tools_enable_alias() {
-        let command = parse_tools_command("/tools enable search")
-            .expect("tools command")
-            .expect("valid command");
-        assert!(matches!(
-            command,
-            ToolsCommand::Enable(ToolId::GoogleSearch)
-        ));
-    }
 
     #[test]
     fn tool_profile_builds_google_search_and_functions() {

@@ -59,7 +59,7 @@ Planned tests not yet implemented.
 | T-4 | Integration: GoAway reconnect | Session: simulate or trigger `GoAway` → verify auto-reconnect with resume handle. | Medium |
 | T-5 | E2E: multimodal streaming | Audio + video sent simultaneously; verify both are processed. | Low |
 | T-6 | Stress: reconnection stability | Unstable network simulation → verify no events are dropped across reconnections. | Low |
-| T-7 | CLI parser / reducer / tool-runtime tests | Basic `/tools` parser and catalog tests now exist. Expand coverage to server-event handling, staged-profile apply flow, media input edge cases, and local tool execution boundaries. | High |
+| T-7 | CLI parser / reducer / tool-runtime tests | Basic slash parser/completion coverage plus tool-catalog tests now exist. Expand coverage to server-event handling, staged-profile apply flow, media input edge cases, and local tool execution boundaries. | High |
 
 ## Tech Debt
 

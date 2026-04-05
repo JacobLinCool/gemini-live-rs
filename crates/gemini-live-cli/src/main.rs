@@ -37,9 +37,11 @@
 
 #[cfg(any(feature = "mic", feature = "speak"))]
 mod audio_io;
+mod input;
 mod media;
 #[cfg(feature = "share-screen")]
 mod screen;
+mod slash;
 mod tooling;
 mod update;
 
@@ -47,12 +49,12 @@ use std::collections::HashMap;
 use std::io;
 use std::{error::Error, fmt};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -416,7 +418,9 @@ const AEC_SEND_RATE: u32 = 48_000;
 struct App {
     messages: Vec<Msg>,
     pending: String,
-    input: String,
+    input: input::InputEditor,
+    completions: Vec<slash::CompletionItem>,
+    completion_index: usize,
     quit: bool,
     title: String,
     active_tools: tooling::ToolProfile,
@@ -462,7 +466,9 @@ impl App {
                 text: "connected — @file for media, /mic /speak to toggle audio, /share-screen to share screen, /tools to manage Live tools".to_string(),
             }],
             pending: String::new(),
-            input: String::new(),
+            input: input::InputEditor::new(),
+            completions: Vec::new(),
+            completion_index: 0,
             quit: false,
             title: title.to_string(),
             active_tools: tools,
@@ -481,6 +487,53 @@ impl App {
             role: Role::System,
             text,
         });
+    }
+
+    fn refresh_completions(&mut self) {
+        let selected = self
+            .completions
+            .get(self.completion_index)
+            .map(|item| item.label.clone());
+        self.completions = slash::completions(&self.input.text());
+        self.completion_index = selected
+            .and_then(|label| self.completions.iter().position(|item| item.label == label))
+            .unwrap_or(0);
+    }
+
+    fn completion_count(&self) -> usize {
+        self.completions.len().min(5)
+    }
+
+    fn has_completions(&self) -> bool {
+        !self.completions.is_empty()
+    }
+
+    fn select_next_completion(&mut self) {
+        if self.completions.is_empty() {
+            return;
+        }
+        self.completion_index = (self.completion_index + 1) % self.completions.len();
+    }
+
+    fn select_prev_completion(&mut self) {
+        if self.completions.is_empty() {
+            return;
+        }
+        self.completion_index = if self.completion_index == 0 {
+            self.completions.len() - 1
+        } else {
+            self.completion_index - 1
+        };
+    }
+
+    fn apply_selected_completion(&mut self) -> bool {
+        let Some(item) = self.completions.get(self.completion_index).cloned() else {
+            return false;
+        };
+        self.input
+            .replace_range(item.replace_range, &item.replacement);
+        self.refresh_completions();
+        true
     }
 }
 
@@ -560,6 +613,7 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir()?;
     let mut app = App::new(&startup.connection_label(), tooling::ToolProfile::default());
+    app.refresh_completions();
     let mut tool_runtime = tooling::ToolRuntime::new(workspace_root.clone(), app.active_tools)?;
 
     app.sys(format!("tools active: {}", app.active_tools.summary()));
@@ -594,7 +648,7 @@ async fn run(
     let mut term_events = EventStream::new();
 
     loop {
-        terminal.draw(|f| render(f, &app))?;
+        terminal.draw(|f| render(f, &mut app))?;
         if app.quit {
             break;
         }
@@ -604,7 +658,7 @@ async fn run(
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
                 {
-                    match handle_key(&mut app, key.code, key.modifiers, &session).await? {
+                    match handle_key(&mut app, key, &session).await? {
                         #[cfg(feature = "mic")]
                         Some(Cmd::ToggleMic) => toggle_mic(&mut app, &mut mic, &mic_tx, &aec, &session).await,
                         #[cfg(feature = "speak")]
@@ -734,39 +788,37 @@ enum Cmd {
 
 async fn handle_key(
     app: &mut App,
-    code: KeyCode,
-    mods: KeyModifiers,
+    key: KeyEvent,
     session: &Session,
 ) -> Result<Option<Cmd>, Box<dyn std::error::Error>> {
-    match code {
+    match key.code {
         KeyCode::Enter => {
-            let raw = std::mem::take(&mut app.input);
+            let raw = app.input.take_text();
+            app.refresh_completions();
             let trimmed = raw.trim().to_string();
-            #[cfg(feature = "mic")]
-            if trimmed == "/mic" {
-                return Ok(Some(Cmd::ToggleMic));
-            }
-            #[cfg(feature = "speak")]
-            if trimmed == "/speak" {
-                return Ok(Some(Cmd::ToggleSpeaker));
-            }
-            #[cfg(feature = "share-screen")]
-            if let Some(args) = trimmed.strip_prefix("/share-screen") {
-                return Ok(Some(Cmd::ShareScreen(args.trim().to_string())));
-            }
-            if let Some(command) = tooling::parse_tools_command(&trimmed) {
+            if let Some(command) = slash::parse(&trimmed) {
                 match command {
-                    Ok(tooling::ToolsCommand::Status) => {
+                    #[cfg(feature = "mic")]
+                    Ok(slash::SlashCommand::ToggleMic) => return Ok(Some(Cmd::ToggleMic)),
+                    #[cfg(feature = "speak")]
+                    Ok(slash::SlashCommand::ToggleSpeaker) => {
+                        return Ok(Some(Cmd::ToggleSpeaker));
+                    }
+                    #[cfg(feature = "share-screen")]
+                    Ok(slash::SlashCommand::ShareScreen(args)) => {
+                        return Ok(Some(Cmd::ShareScreen(args)));
+                    }
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Status)) => {
                         for line in tooling::status_lines(app.active_tools, app.desired_tools) {
                             app.sys(line);
                         }
                     }
-                    Ok(tooling::ToolsCommand::List) => {
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::List)) => {
                         for line in tooling::catalog_lines(app.active_tools, app.desired_tools) {
                             app.sys(line);
                         }
                     }
-                    Ok(tooling::ToolsCommand::Enable(tool)) => {
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Enable(tool))) => {
                         if app.desired_tools.set(tool, true) {
                             app.sys(format!(
                                 "staged tool enable: {} (run `/tools apply` to reconnect)",
@@ -776,7 +828,7 @@ async fn handle_key(
                             app.sys(format!("tool already staged on: {}", tool.key()));
                         }
                     }
-                    Ok(tooling::ToolsCommand::Disable(tool)) => {
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Disable(tool))) => {
                         if app.desired_tools.set(tool, false) {
                             app.sys(format!(
                                 "staged tool disable: {} (run `/tools apply` to reconnect)",
@@ -786,7 +838,7 @@ async fn handle_key(
                             app.sys(format!("tool already staged off: {}", tool.key()));
                         }
                     }
-                    Ok(tooling::ToolsCommand::Toggle(tool)) => {
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Toggle(tool))) => {
                         let enabled = app.desired_tools.toggle(tool);
                         let action = if enabled { "enable" } else { "disable" };
                         app.sys(format!(
@@ -794,8 +846,10 @@ async fn handle_key(
                             tool.key()
                         ));
                     }
-                    Ok(tooling::ToolsCommand::Apply) => return Ok(Some(Cmd::ApplyTools)),
-                    Err(err) => app.sys(format!("[tools] {err}")),
+                    Ok(slash::SlashCommand::Tools(tooling::ToolsCommand::Apply)) => {
+                        return Ok(Some(Cmd::ApplyTools));
+                    }
+                    Err(err) => app.sys(format!("[slash] {err}")),
                 }
                 return Ok(None);
             }
@@ -803,13 +857,25 @@ async fn handle_key(
                 send_user_input(app, session, &trimmed).await?;
             }
         }
-        KeyCode::Char('c' | 'd') if mods.contains(KeyModifiers::CONTROL) => app.quit = true,
-        KeyCode::Esc => app.quit = true,
-        KeyCode::Char(c) => app.input.push(c),
-        KeyCode::Backspace => {
-            app.input.pop();
+        KeyCode::Tab => {
+            if !app.apply_selected_completion() {
+                app.input.handle_key(key);
+                app.refresh_completions();
+            }
         }
-        _ => {}
+        KeyCode::BackTab => {
+            app.select_prev_completion();
+        }
+        KeyCode::Up if app.has_completions() => app.select_prev_completion(),
+        KeyCode::Down if app.has_completions() => app.select_next_completion(),
+        KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.quit = true
+        }
+        KeyCode::Esc => app.quit = true,
+        _ => {
+            app.input.handle_key(key);
+            app.refresh_completions();
+        }
     }
     Ok(None)
 }
@@ -1021,10 +1087,19 @@ fn handle_server_event(
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
-fn render(frame: &mut ratatui::Frame, app: &App) {
-    let [chat_area, input_area] = Layout::default()
+fn render(frame: &mut ratatui::Frame, app: &mut App) {
+    let completion_height = if app.has_completions() {
+        app.completion_count() as u16 + 2
+    } else {
+        0
+    };
+    let [chat_area, completion_area, input_area] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(completion_height),
+            Constraint::Length(3),
+        ])
         .areas(frame.area());
 
     // Chat
@@ -1118,13 +1193,45 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     });
     let status = format!(" {} ", status_parts.join(" | "));
 
-    let input = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(app.input.as_str()),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title(status));
-    frame.render_widget(input, input_area);
+    if app.has_completions() {
+        let lines = app
+            .completions
+            .iter()
+            .take(app.completion_count())
+            .enumerate()
+            .map(|(idx, item)| {
+                let selected = idx == app.completion_index;
+                let marker = if selected { "› " } else { "  " };
+                let marker_style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let label_style = if selected {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(item.label.as_str(), label_style),
+                    Span::raw(" "),
+                    Span::styled(item.detail.as_str(), Style::default().fg(Color::DarkGray)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let completion = Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" completions: Tab accept, Up/Down select "),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(completion, completion_area);
+    }
 
-    let cx = (input_area.x + 3 + app.input.len() as u16).min(input_area.right().saturating_sub(2));
-    frame.set_cursor_position(Position::new(cx, input_area.y + 1));
+    let input_widget = app.input.render_widget(status);
+    frame.render_widget(input_widget, input_area);
 }

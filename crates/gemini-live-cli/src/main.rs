@@ -552,8 +552,21 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         ]));
     }
 
+    // Estimate total rendered lines accounting for word-wrap.
+    let content_width = chat_area.width.saturating_sub(2) as usize; // minus borders
+    let wrapped_lines: usize = lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if content_width == 0 {
+                1
+            } else {
+                (line_width / content_width) + 1
+            }
+        })
+        .sum();
     let visible = chat_area.height.saturating_sub(2) as usize;
-    let scroll = lines.len().saturating_sub(visible) as u16;
+    let scroll = wrapped_lines.saturating_sub(visible) as u16;
 
     let chat = Paragraph::new(Text::from(lines))
         .block(

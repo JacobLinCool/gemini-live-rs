@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 media_resolution: Some(MediaResolution::MediaResolutionHigh),
                 ..Default::default()
             }),
+            input_audio_transcription: Some(AudioTranscriptionConfig {}),
             output_audio_transcription: Some(AudioTranscriptionConfig {}),
             ..Default::default()
         },

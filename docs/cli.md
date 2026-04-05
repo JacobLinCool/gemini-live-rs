@@ -1,6 +1,6 @@
 # gemini-live-cli
 
-Interactive TUI client for the Gemini Multimodal Live API.  Serves as both
+Interactive TUI client for the Gemini Multimodal Live API. Serves as both
 a practical tool and a living usage example of the `gemini-live` library.
 
 ## Quick Start
@@ -15,13 +15,26 @@ Override the model:
 GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest cargo run -p gemini-live-cli
 ```
 
+## Current Session Profile
+
+The current CLI is intentionally opinionated:
+
+- It connects with `responseModalities = ["AUDIO"]`
+- It enables `inputAudioTranscription`
+- It enables `outputAudioTranscription`
+- It does **not** execute Live API tool calls yet
+
+That means the default experience is "model speaks, CLI shows the output
+transcript" while also rendering user speech transcriptions when the API sends
+them. Any future text-first, hybrid, or tool-enabled modes should be documented
+here as explicit profiles rather than being implied by examples.
+
 ## UI Layout
 
 ```
 ┌─ models/gemini-3.1-flash-live-preview ──────────────────┐
 │   connected — @file for media, /mic /speak for audio    │
 │ [you] hello                                             │
-│ [you] (transcription) 你好                               │  ← mic input transcript
 │ [model] 你好！有什麼我可以幫你的嗎？                       │
 │   [image] photo.jpg (45.2 KB, image/jpeg)               │  ← system info
 │ [model] I see a screenshot showing...                   │
@@ -34,6 +47,7 @@ GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest cargo run -p gemini-liv
 - **Top panel**: conversation history, auto-scrolls to bottom
 - **Bottom panel**: always-active input — you can type while the model is responding
 - **Status bar**: current state of audio/screen features
+- **Output transcript**: shown as model text when output audio transcription is enabled
 
 ## Commands
 
@@ -48,6 +62,9 @@ GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest cargo run -p gemini-liv
 
 Supported image formats: JPEG, PNG, GIF, WebP, BMP.
 Supported audio formats: WAV (any sample rate, auto mono mixdown), raw PCM (.pcm/.raw, assumed 16kHz mono).
+
+File paths are currently parsed by splitting on whitespace. Paths containing
+spaces are not supported yet.
 
 ### Slash Commands
 
@@ -100,3 +117,9 @@ The main loop uses `tokio::select!` to concurrently poll:
 
 This non-blocking design means the user can type, receive model responses, and
 stream audio/video simultaneously without any of these blocking each other.
+
+## Current Limitations
+
+- No first-class tool execution path yet; `ToolCall` messages are ignored
+- No explicit text / hybrid / voice profile selection beyond environment variables
+- The self-update command only works for targets that are actually published in GitHub Releases

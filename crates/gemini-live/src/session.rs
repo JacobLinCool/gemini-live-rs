@@ -34,7 +34,6 @@ use base64::Engine;
 use futures_util::Stream;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::audio::INPUT_AUDIO_MIME;
 use crate::codec;
 use crate::error::SessionError;
 use crate::transport::{Connection, RawFrame, TransportConfig};
@@ -171,17 +170,32 @@ impl Session {
     /// call (`roadmap.md` P-1).  For zero-allocation streaming, use
     /// [`AudioEncoder`](crate::audio::AudioEncoder) with [`send_raw`](Self::send_raw).
     pub async fn send_audio(&self, pcm_i16_le: &[u8]) -> Result<(), SessionError> {
+        self.send_audio_at_rate(pcm_i16_le, crate::audio::INPUT_SAMPLE_RATE)
+            .await
+    }
+
+    /// Stream audio at a specific sample rate.
+    ///
+    /// Like [`send_audio`](Self::send_audio) but lets you specify the sample
+    /// rate (e.g. for mic capture at the device's native rate).  The server
+    /// resamples as needed.
+    ///
+    /// **Performance note:** allocates a new `String` for base64 on every
+    /// call (`roadmap.md` P-1).  For zero-allocation streaming, use
+    /// [`AudioEncoder`](crate::audio::AudioEncoder) with [`send_raw`](Self::send_raw).
+    pub async fn send_audio_at_rate(
+        &self,
+        pcm_i16_le: &[u8],
+        sample_rate: u32,
+    ) -> Result<(), SessionError> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_i16_le);
+        let mime = format!("audio/pcm;rate={sample_rate}");
         self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
             audio: Some(Blob {
                 data: b64,
-                mime_type: INPUT_AUDIO_MIME.into(),
+                mime_type: mime,
             }),
-            video: None,
-            text: None,
-            activity_start: None,
-            activity_end: None,
-            audio_stream_end: None,
+            ..Default::default()
         }))
         .await
     }
@@ -194,11 +208,7 @@ impl Session {
                 data: b64,
                 mime_type: mime.into(),
             }),
-            audio: None,
-            text: None,
-            activity_start: None,
-            activity_end: None,
-            audio_stream_end: None,
+            ..Default::default()
         }))
         .await
     }
@@ -207,11 +217,7 @@ impl Session {
     pub async fn send_text(&self, text: &str) -> Result<(), SessionError> {
         self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
             text: Some(text.into()),
-            audio: None,
-            video: None,
-            activity_start: None,
-            activity_end: None,
-            audio_stream_end: None,
+            ..Default::default()
         }))
         .await
     }
@@ -225,11 +231,7 @@ impl Session {
     pub async fn activity_start(&self) -> Result<(), SessionError> {
         self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
             activity_start: Some(EmptyObject {}),
-            audio: None,
-            video: None,
-            text: None,
-            activity_end: None,
-            audio_stream_end: None,
+            ..Default::default()
         }))
         .await
     }
@@ -238,11 +240,7 @@ impl Session {
     pub async fn activity_end(&self) -> Result<(), SessionError> {
         self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
             activity_end: Some(EmptyObject {}),
-            audio: None,
-            video: None,
-            text: None,
-            activity_start: None,
-            audio_stream_end: None,
+            ..Default::default()
         }))
         .await
     }
@@ -251,11 +249,7 @@ impl Session {
     pub async fn audio_stream_end(&self) -> Result<(), SessionError> {
         self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
             audio_stream_end: Some(true),
-            audio: None,
-            video: None,
-            text: None,
-            activity_start: None,
-            activity_end: None,
+            ..Default::default()
         }))
         .await
     }

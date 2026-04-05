@@ -14,7 +14,6 @@ mod media;
 
 use std::io;
 
-use base64::Engine;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
@@ -191,7 +190,7 @@ async fn run(
             }
             Some(pcm) = mic_rx.recv() => {
                 let rate = mic.as_ref().map(|m| m.sample_rate).unwrap_or(16_000);
-                send_audio_at_rate(&session, &pcm, rate).await.ok();
+                session.send_audio_at_rate(&pcm, rate).await.ok();
             }
         }
     }
@@ -298,7 +297,7 @@ async fn send_user_input(
                         session.send_video(&data, mime).await?;
                     }
                     media::Media::Audio { pcm, sample_rate } => {
-                        send_audio_at_rate(session, &pcm, sample_rate).await?;
+                        session.send_audio_at_rate(&pcm, sample_rate).await?;
                     }
                 }
             }
@@ -313,33 +312,6 @@ async fn send_user_input(
         session.send_text(&text).await?;
     }
 
-    Ok(())
-}
-
-/// Send audio PCM at an arbitrary sample rate.
-///
-/// The library's `Session::send_audio` hardcodes 16 kHz.  This helper wraps
-/// `send_raw` to specify the correct rate — needed for mic capture (device
-/// native rate) and WAV files (file native rate).
-async fn send_audio_at_rate(
-    session: &Session,
-    pcm_i16_le: &[u8],
-    sample_rate: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_i16_le);
-    session
-        .send_raw(ClientMessage::RealtimeInput(RealtimeInput {
-            audio: Some(Blob {
-                data: b64,
-                mime_type: format!("audio/pcm;rate={sample_rate}"),
-            }),
-            video: None,
-            text: None,
-            activity_start: None,
-            activity_end: None,
-            audio_stream_end: None,
-        }))
-        .await?;
     Ok(())
 }
 

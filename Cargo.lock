@@ -598,7 +598,6 @@ dependencies = [
 name = "gemini-live-cli"
 version = "0.1.0"
 dependencies = [
- "base64",
  "cpal",
  "crossterm",
  "futures-util",

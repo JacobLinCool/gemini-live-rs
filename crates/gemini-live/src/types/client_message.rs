@@ -98,7 +98,7 @@ pub struct ClientContent {
 ///
 /// # Video format
 /// JPEG or PNG, max 1 fps, recommended < 200 KB per frame.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RealtimeInput {
     #[serde(skip_serializing_if = "Option::is_none")]

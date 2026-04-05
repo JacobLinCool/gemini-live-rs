@@ -1,5 +1,10 @@
 # gemini-live-rs
 
+[![crates.io](https://img.shields.io/crates/v/gemini-live.svg)](https://crates.io/crates/gemini-live)
+[![docs.rs](https://docs.rs/gemini-live/badge.svg)](https://docs.rs/gemini-live)
+[![CI](https://github.com/jacoblincool/gemini-live-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/jacoblincool/gemini-live-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 High-performance Rust client for the [Gemini Multimodal Live API](https://ai.google.dev/api/live) — real-time, bidirectional audio/video/text streaming over WebSocket.
 
 ## Features
@@ -17,7 +22,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gemini-live = { git = "https://github.com/jacoblincool/gemini-live-rs" }
+gemini-live = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -117,12 +122,70 @@ while let Some(event) = session.next_event().await {
 
 ## CLI
 
-An interactive TUI client with microphone, speaker, screen sharing, and file
-sending support.  See [`docs/cli.md`](docs/cli.md) for full usage.
+[![crates.io](https://img.shields.io/crates/v/gemini-live-cli.svg)](https://crates.io/crates/gemini-live-cli)
+
+An interactive TUI client with microphone, speaker, screen sharing, and file sending support. See [`docs/cli.md`](docs/cli.md) for full usage.
+
+### Install
+
+Pre-built binary (Linux / macOS):
 
 ```bash
-GEMINI_API_KEY=your-key cargo run -p gemini-live-cli
+curl -fsSL https://raw.githubusercontent.com/jacoblincool/gemini-live-rs/main/install.sh | bash
 ```
+
+Or via Cargo:
+
+```bash
+cargo install gemini-live-cli
+```
+
+Build without audio/screen features for a minimal binary:
+
+```bash
+cargo install gemini-live-cli --no-default-features
+```
+
+### Usage
+
+```bash
+export GEMINI_API_KEY=your-key
+gemini-live
+```
+
+Override the model:
+
+```bash
+GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest gemini-live
+```
+
+### Commands
+
+| Input | Action |
+|-------|--------|
+| `hello` | Send text to the model |
+| `@photo.jpg` | Send an image file |
+| `@recording.wav` | Send a WAV audio file |
+| `@photo.jpg describe this` | Send image + text together |
+| `/mic` | Toggle microphone input (with AEC) |
+| `/speak` | Toggle speaker output (with AEC) |
+| `/share-screen list` | List available capture targets |
+| `/share-screen <id> [interval]` | Start sharing a monitor or window |
+| `/share-screen` | Stop screen sharing |
+
+### Self-update
+
+```bash
+gemini-live update
+```
+
+### Feature Flags
+
+| Feature | Dependencies | Enables |
+|---------|-------------|---------|
+| `mic` (default) | `cpal`, `webrtc-audio-processing` | `/mic` command with AEC |
+| `speak` (default) | `cpal`, `webrtc-audio-processing` | `/speak` command with AEC |
+| `share-screen` (default) | `xcap`, `image` | `/share-screen` command |
 
 ## Documentation
 

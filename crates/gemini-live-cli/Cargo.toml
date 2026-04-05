@@ -17,3 +17,4 @@ futures-util = { workspace = true }
 hound = "3.5"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+cpal = "0.15"

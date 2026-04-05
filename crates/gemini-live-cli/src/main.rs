@@ -1,3 +1,4 @@
+mod audio_io;
 mod media;
 
 use std::io;
@@ -6,12 +7,12 @@ use base64::Engine;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
@@ -22,19 +23,16 @@ use gemini_live::types::*;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .with_writer(io::stderr)
         .init();
 
-    let api_key =
-        std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY environment variable");
+    let api_key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY environment variable");
     let model = std::env::var("GEMINI_MODEL")
         .unwrap_or_else(|_| "models/gemini-3.1-flash-live-preview".into());
 
-    // Connect before entering TUI
-    eprintln!("connecting to {model}…");
+    eprintln!("connecting to {model}...");
     let session = Session::connect(SessionConfig {
         transport: TransportConfig {
             auth: Auth::ApiKey(api_key),
@@ -54,7 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // Setup terminal
     install_panic_hook();
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, session, &model).await;
@@ -62,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-// ── Terminal setup ───────────────────────────────────────────────────────────
+// ── Terminal ─────────────────────────────────────────────────────────────────
 
 fn init_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     crossterm::terminal::enable_raw_mode()?;
@@ -89,11 +86,12 @@ fn install_panic_hook() {
 
 struct App {
     messages: Vec<Msg>,
-    /// Accumulates streaming model response until TurnComplete.
     pending: String,
     input: String,
     quit: bool,
     title: String,
+    mic_on: bool,
+    speak_on: bool,
 }
 
 struct Msg {
@@ -113,13 +111,22 @@ impl App {
         Self {
             messages: vec![Msg {
                 role: Role::System,
-                text: "connected — @file.jpg / @file.wav for media".to_string(),
+                text: "connected — @file for media, /mic /speak to toggle audio".to_string(),
             }],
             pending: String::new(),
             input: String::new(),
             quit: false,
             title: model.to_string(),
+            mic_on: false,
+            speak_on: false,
         }
+    }
+
+    fn sys(&mut self, text: String) {
+        self.messages.push(Msg {
+            role: Role::System,
+            text,
+        });
     }
 }
 
@@ -132,7 +139,7 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(model);
 
-    // Bridge session events into a channel so we can select! on them.
+    // Session events → channel
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
     let mut recv = session.clone();
     tokio::spawn(async move {
@@ -142,6 +149,11 @@ async fn run(
             }
         }
     });
+
+    // Mic channel (always exists; data only flows when mic is active)
+    let (mic_tx, mut mic_rx) = mpsc::channel::<Vec<u8>>(32);
+    let mut mic: Option<audio_io::Mic> = None;
+    let mut speaker: Option<audio_io::Speaker> = None;
 
     let mut term_events = EventStream::new();
 
@@ -156,11 +168,30 @@ async fn run(
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
                 {
-                    handle_key(&mut app, key.code, key.modifiers, &session).await?;
+                    match handle_key(&mut app, key.code, key.modifiers, &session).await? {
+                        Some(Cmd::ToggleMic) => toggle_mic(&mut app, &mut mic, &mic_tx, &session).await,
+                        Some(Cmd::ToggleSpeaker) => toggle_speaker(&mut app, &mut speaker),
+                        None => {}
+                    }
                 }
             }
             Some(srv) = srv_rx.recv() => {
-                handle_server_event(&mut app, srv);
+                handle_server_event(&mut app, srv, &speaker);
+            }
+            Some(pcm) = mic_rx.recv() => {
+                let rate = mic.as_ref().map(|m| m.sample_rate).unwrap_or(16_000);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);
+                session.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
+                    audio: Some(Blob {
+                        data: b64,
+                        mime_type: format!("audio/pcm;rate={rate}"),
+                    }),
+                    video: None,
+                    text: None,
+                    activity_start: None,
+                    activity_end: None,
+                    audio_stream_end: None,
+                })).await.ok();
             }
         }
     }
@@ -169,38 +200,82 @@ async fn run(
     Ok(())
 }
 
-// ── Key handling ─────────────────────────────────────────────────────────────
+// ── Commands ─────────────────────────────────────────────────────────────────
+
+enum Cmd {
+    ToggleMic,
+    ToggleSpeaker,
+}
 
 async fn handle_key(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
     session: &Session,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<Cmd>, Box<dyn std::error::Error>> {
     match code {
         KeyCode::Enter => {
             let raw = std::mem::take(&mut app.input);
             let trimmed = raw.trim().to_string();
-            if !trimmed.is_empty() {
-                send_user_input(app, session, &trimmed).await?;
+            match trimmed.as_str() {
+                "/mic" => return Ok(Some(Cmd::ToggleMic)),
+                "/speak" => return Ok(Some(Cmd::ToggleSpeaker)),
+                s if !s.is_empty() => send_user_input(app, session, s).await?,
+                _ => {}
             }
         }
-        KeyCode::Char('c' | 'd') if mods.contains(KeyModifiers::CONTROL) => {
-            app.quit = true;
-        }
-        KeyCode::Esc => {
-            app.quit = true;
-        }
-        KeyCode::Char(c) => {
-            app.input.push(c);
-        }
+        KeyCode::Char('c' | 'd') if mods.contains(KeyModifiers::CONTROL) => app.quit = true,
+        KeyCode::Esc => app.quit = true,
+        KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => {
             app.input.pop();
         }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
+
+async fn toggle_mic(
+    app: &mut App,
+    mic: &mut Option<audio_io::Mic>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    session: &Session,
+) {
+    if mic.is_some() {
+        *mic = None;
+        app.mic_on = false;
+        app.sys("mic off".into());
+        session.audio_stream_end().await.ok();
+    } else {
+        match audio_io::Mic::start(tx.clone()) {
+            Ok(m) => {
+                app.sys(format!("mic on ({}Hz)", m.sample_rate));
+                app.mic_on = true;
+                *mic = Some(m);
+            }
+            Err(e) => app.sys(format!("mic failed: {e}")),
+        }
+    }
+}
+
+fn toggle_speaker(app: &mut App, speaker: &mut Option<audio_io::Speaker>) {
+    if speaker.is_some() {
+        *speaker = None;
+        app.speak_on = false;
+        app.sys("speaker off".into());
+    } else {
+        match audio_io::Speaker::start() {
+            Ok(s) => {
+                app.sys(format!("speaker on ({}Hz)", s.device_rate));
+                app.speak_on = true;
+                *speaker = Some(s);
+            }
+            Err(e) => app.sys(format!("speaker failed: {e}")),
+        }
+    }
+}
+
+// ── Send user input ──────────────────────────────────────────────────────────
 
 async fn send_user_input(
     app: &mut App,
@@ -209,20 +284,15 @@ async fn send_user_input(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (text, file_paths) = media::parse_input(line);
 
-    // Show the full input as a user message.
     app.messages.push(Msg {
         role: Role::User,
         text: line.to_string(),
     });
 
-    // Send media files.
     for path in &file_paths {
         match media::load(path) {
             Ok(m) => {
-                app.messages.push(Msg {
-                    role: Role::System,
-                    text: media::describe(path, &m),
-                });
+                app.sys(media::describe(path, &m));
                 match m {
                     media::Media::Image { data, mime } => {
                         session.send_video(&data, mime).await?;
@@ -245,16 +315,10 @@ async fn send_user_input(
                     }
                 }
             }
-            Err(e) => {
-                app.messages.push(Msg {
-                    role: Role::System,
-                    text: format!("[skip] @{path}: {e}"),
-                });
-            }
+            Err(e) => app.sys(format!("[skip] @{path}: {e}")),
         }
     }
 
-    // Send text (with brief delay after media for model processing).
     if !text.is_empty() {
         if !file_paths.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -267,11 +331,10 @@ async fn send_user_input(
 
 // ── Server events ────────────────────────────────────────────────────────────
 
-fn handle_server_event(app: &mut App, event: ServerEvent) {
+fn handle_server_event(app: &mut App, event: ServerEvent, speaker: &Option<audio_io::Speaker>) {
     match event {
-        ServerEvent::OutputTranscription(text) => {
-            app.pending.push_str(&text);
-        }
+        ServerEvent::OutputTranscription(text) => app.pending.push_str(&text),
+        ServerEvent::ModelText(text) => app.pending.push_str(&text),
         ServerEvent::TurnComplete => {
             if !app.pending.is_empty() {
                 app.messages.push(Msg {
@@ -280,22 +343,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent) {
                 });
             }
         }
-        ServerEvent::ModelText(text) => {
-            // Fallback for text-mode models (no audio transcription).
-            app.pending.push_str(&text);
+        ServerEvent::ModelAudio(data) => {
+            if let Some(s) = speaker {
+                s.push(&data);
+            }
         }
-        ServerEvent::Error(e) => {
-            app.messages.push(Msg {
-                role: Role::System,
-                text: format!("[error] {}", e.message),
-            });
-        }
+        ServerEvent::Error(e) => app.sys(format!("[error] {}", e.message)),
         ServerEvent::Closed { reason } => {
             if !reason.is_empty() {
-                app.messages.push(Msg {
-                    role: Role::System,
-                    text: format!("[closed] {reason}"),
-                });
+                app.sys(format!("[closed] {reason}"));
             }
             app.quit = true;
         }
@@ -311,10 +367,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .areas(frame.area());
 
-    // ── Chat ─────────────────────────────────────────────────────────────
+    // Chat
     let mut lines: Vec<Line> = Vec::new();
     for msg in &app.messages {
-        let (prefix, prefix_style, text_style) = match msg.role {
+        let (prefix, ps, ts) = match msg.role {
             Role::User => (
                 "[you] ",
                 Style::default()
@@ -336,12 +392,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
             ),
         };
         lines.push(Line::from(vec![
-            Span::styled(prefix, prefix_style),
-            Span::styled(msg.text.as_str(), text_style),
+            Span::styled(prefix, ps),
+            Span::styled(msg.text.as_str(), ts),
         ]));
     }
-
-    // Streaming partial response.
     if !app.pending.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(
@@ -350,14 +404,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                app.pending.as_str(),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(app.pending.as_str(), Style::default().fg(Color::DarkGray)),
         ]));
     }
 
-    // Auto-scroll: estimate scroll offset so the bottom is visible.
     let visible = chat_area.height.saturating_sub(2) as usize;
     let scroll = lines.len().saturating_sub(visible) as u16;
 
@@ -371,16 +421,22 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         .scroll((scroll, 0));
     frame.render_widget(chat, chat_area);
 
-    // ── Input ────────────────────────────────────────────────────────────
+    // Input + status
+    let mic_label = if app.mic_on { "mic: ON" } else { "mic: off" };
+    let speak_label = if app.speak_on {
+        "speak: ON"
+    } else {
+        "speak: off"
+    };
+    let status = format!(" {mic_label} | {speak_label} ");
+
     let input = Paragraph::new(Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::Cyan)),
         Span::raw(app.input.as_str()),
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .block(Block::default().borders(Borders::ALL).title(status));
     frame.render_widget(input, input_area);
 
-    // Cursor
-    let cx = (input_area.x + 3 + app.input.len() as u16).min(input_area.right() - 2);
-    let cy = input_area.y + 1;
-    frame.set_cursor_position(Position::new(cx, cy));
+    let cx = (input_area.x + 3 + app.input.len() as u16).min(input_area.right().saturating_sub(2));
+    frame.set_cursor_position(Position::new(cx, input_area.y + 1));
 }

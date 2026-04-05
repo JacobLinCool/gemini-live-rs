@@ -212,6 +212,14 @@ impl Speaker {
         })
     }
 
+    /// Discard all buffered audio. Called on interruption to stop the model
+    /// from talking over the user.
+    pub fn clear(&self) {
+        if let Ok(mut buf) = self.buffer.lock() {
+            buf.clear();
+        }
+    }
+
     /// Push model audio (24 kHz i16-LE PCM) into the playback buffer.
     pub fn push(&self, pcm_i16_le: &[u8]) {
         const MODEL_RATE: u32 = 24_000;

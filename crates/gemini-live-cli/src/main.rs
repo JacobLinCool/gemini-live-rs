@@ -480,6 +480,13 @@ fn handle_server_event(
                 s.push(&data);
             }
         }
+        ServerEvent::Interrupted => {
+            // Discard speaker buffer to stop talking over the user.
+            #[cfg(feature = "speak")]
+            if let Some(s) = speaker {
+                s.clear();
+            }
+        }
         ServerEvent::Error(e) => app.sys(format!("[error] {}", e.message)),
         ServerEvent::Closed { reason } => {
             if !reason.is_empty() {

@@ -4,15 +4,15 @@
 //! through a tokio channel.  [`Speaker`] opens the default output device and
 //! plays model audio (24 kHz) resampled to the device's native rate.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use tokio::sync::mpsc;
 
 // ── Microphone ───────────────────────────────────────────────────────────────
 
+#[cfg(feature = "mic")]
+use tokio::sync::mpsc;
+
+#[cfg(feature = "mic")]
 /// Captures audio from the default input device and sends PCM chunks
 /// (mono i16-LE bytes) through a channel.
 pub struct Mic {
@@ -20,6 +20,7 @@ pub struct Mic {
     pub sample_rate: u32,
 }
 
+#[cfg(feature = "mic")]
 impl Mic {
     pub fn start(tx: mpsc::Sender<Vec<u8>>) -> Result<Self, String> {
         let host = cpal::default_host();
@@ -58,6 +59,7 @@ impl Mic {
     }
 }
 
+#[cfg(feature = "mic")]
 fn mono_i16_le_from_f32(data: &[f32], channels: usize) -> Vec<u8> {
     data.chunks(channels)
         .flat_map(|frame| {
@@ -68,6 +70,7 @@ fn mono_i16_le_from_f32(data: &[f32], channels: usize) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(feature = "mic")]
 fn mono_i16_le_from_i16(data: &[i16], channels: usize) -> Vec<u8> {
     data.chunks(channels)
         .flat_map(|frame| {
@@ -79,15 +82,22 @@ fn mono_i16_le_from_i16(data: &[i16], channels: usize) -> Vec<u8> {
 
 // ── Speaker ──────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "speak")]
+use std::collections::VecDeque;
+#[cfg(feature = "speak")]
+use std::sync::{Arc, Mutex};
+
 /// Plays audio through the default output device.
 /// Model audio (24 kHz i16-LE PCM) is pushed via [`Speaker::push`] and
 /// resampled to the device's native rate.
+#[cfg(feature = "speak")]
 pub struct Speaker {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<VecDeque<f32>>>,
     pub device_rate: u32,
 }
 
+#[cfg(feature = "speak")]
 impl Speaker {
     pub fn start() -> Result<Self, String> {
         let host = cpal::default_host();
@@ -148,6 +158,7 @@ impl Speaker {
     }
 }
 
+#[cfg(feature = "speak")]
 fn fill_f32(data: &mut [f32], channels: usize, buffer: &Mutex<VecDeque<f32>>) {
     if let Ok(mut buf) = buffer.try_lock() {
         for frame in data.chunks_mut(channels) {
@@ -159,6 +170,7 @@ fn fill_f32(data: &mut [f32], channels: usize, buffer: &Mutex<VecDeque<f32>>) {
     }
 }
 
+#[cfg(feature = "speak")]
 fn fill_i16(data: &mut [i16], channels: usize, buffer: &Mutex<VecDeque<f32>>) {
     if let Ok(mut buf) = buffer.try_lock() {
         for frame in data.chunks_mut(channels) {
@@ -170,6 +182,7 @@ fn fill_i16(data: &mut [i16], channels: usize, buffer: &Mutex<VecDeque<f32>>) {
     }
 }
 
+#[cfg(feature = "speak")]
 fn linear_resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();

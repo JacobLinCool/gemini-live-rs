@@ -117,22 +117,18 @@ while let Some(event) = session.next_event().await {
 
 ## CLI
 
-An interactive text-mode CLI is included for quick testing:
+An interactive TUI client with microphone, speaker, screen sharing, and file
+sending support.  See [`docs/cli.md`](docs/cli.md) for full usage.
 
 ```bash
 GEMINI_API_KEY=your-key cargo run -p gemini-live-cli
-```
-
-Override the model with `GEMINI_MODEL`:
-
-```bash
-GEMINI_MODEL=models/gemini-3.1-flash-live-preview cargo run -p gemini-live-cli
 ```
 
 ## Documentation
 
 | File | Purpose |
 |------|---------|
+| `docs/cli.md` | CLI usage, commands, feature flags, and architecture |
 | `docs/protocol.md` | Upstream API reference (endpoints, lifecycle, VAD, session limits, model differences) |
 | `docs/design.md` | Architecture decisions and performance goals |
 | `docs/roadmap.md` | Planned work, known gaps, tech debt |

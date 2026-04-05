@@ -47,6 +47,7 @@ Project-specific docs are split by change-trigger:
 | [`docs/protocol.md`](docs/protocol.md) | Upstream API reference: endpoints, lifecycle, message format, VAD, session limits, model differences | Upstream API changes |
 | [`docs/design.md`](docs/design.md) | Architecture diagram, performance goals, and ADRs | We refactor our architecture |
 | [`docs/roadmap.md`](docs/roadmap.md) | Planned work, performance gaps, and tech debt — single source of truth for "identified but not done" | We identify or complete work items |
+| [`docs/cli.md`](docs/cli.md) | CLI usage, commands, feature flags, and architecture | We change CLI features |
 | [`docs/testing.md`](docs/testing.md) | Implemented test inventory and run instructions | We add or change tests |
 
 - Run `cargo test` to verify all unit and doc tests. Integration tests that hit the real API require a `GEMINI_API_KEY` environment variable.

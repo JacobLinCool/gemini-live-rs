@@ -139,7 +139,7 @@ impl Session {
         state.set_status(SessionStatus::Connecting);
         let mut conn = Connection::connect(&config.transport)
             .await
-            .map_err(|e| SessionError::SetupFailed(e.to_string()))?;
+            .map_err(|e| SessionError::SetupFailed(format_error_chain(&e)))?;
 
         // 2. Send setup and await setupComplete
         do_handshake(&mut conn, &config.setup, None).await?;
@@ -596,7 +596,7 @@ async fn do_handshake(
     tracing::debug!(setup_json = %json, "sending setup message");
     conn.send_text(&json)
         .await
-        .map_err(|e| SessionError::SetupFailed(e.to_string()))?;
+        .map_err(|e| SessionError::SetupFailed(format_error_chain(&e)))?;
 
     tokio::time::timeout(SETUP_TIMEOUT, wait_setup_complete(conn))
         .await
@@ -629,7 +629,7 @@ async fn wait_setup_complete(conn: &mut Connection) -> Result<(), SessionError> 
                     reason.unwrap_or_default()
                 )));
             }
-            Err(e) => return Err(SessionError::SetupFailed(e.to_string())),
+            Err(e) => return Err(SessionError::SetupFailed(format_error_chain(&e))),
         }
     }
 }
@@ -640,7 +640,7 @@ enum SetupResult {
 }
 
 fn try_parse_setup_response(text: &str) -> Result<SetupResult, SessionError> {
-    let msg = codec::decode(text).map_err(|e| SessionError::SetupFailed(e.to_string()))?;
+    let msg = codec::decode(text).map_err(|e| SessionError::SetupFailed(format_error_chain(&e)))?;
     if msg.setup_complete.is_some() {
         return Ok(SetupResult::Complete);
     }
@@ -648,6 +648,20 @@ fn try_parse_setup_response(text: &str) -> Result<SetupResult, SessionError> {
         return Err(SessionError::Api(err.message));
     }
     Ok(SetupResult::Continue)
+}
+
+fn format_error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut current = error.source();
+    while let Some(source) = current {
+        let source_text = source.to_string();
+        if !source_text.is_empty() && !message.ends_with(&source_text) {
+            message.push_str(": ");
+            message.push_str(&source_text);
+        }
+        current = source.source();
+    }
+    message
 }
 
 // ── Backoff ──────────────────────────────────────────────────────────────────
@@ -662,6 +676,8 @@ fn compute_backoff(policy: &ReconnectPolicy, attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::{BearerTokenError, ConnectError};
+
     use super::*;
 
     #[test]
@@ -716,5 +732,18 @@ mod tests {
         assert_eq!(p.base_backoff, Duration::from_millis(500));
         assert_eq!(p.max_backoff, Duration::from_secs(5));
         assert_eq!(p.max_attempts, Some(10));
+    }
+
+    #[test]
+    fn format_error_chain_includes_sources() {
+        let err = ConnectError::Auth(BearerTokenError::with_source(
+            "failed to refresh Google Cloud access token from Application Default Credentials",
+            std::io::Error::other("invalid_grant: Account has been deleted"),
+        ));
+
+        assert_eq!(
+            format_error_chain(&err),
+            "failed to obtain bearer token: failed to refresh Google Cloud access token from Application Default Credentials: invalid_grant: Account has been deleted"
+        );
     }
 }

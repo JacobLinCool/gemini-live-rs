@@ -15,11 +15,34 @@ Override the model:
 GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest cargo run -p gemini-live-cli
 ```
 
+Use Vertex AI with a static bearer token:
+
+```bash
+LIVE_BACKEND=vertex \
+VERTEX_LOCATION=us-central1 \
+VERTEX_MODEL='projects/PROJECT_ID/locations/us-central1/publishers/google/models/MODEL_ID' \
+VERTEX_AI_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)" \
+cargo run -p gemini-live-cli
+```
+
+Use Vertex AI with Application Default Credentials:
+
+```bash
+LIVE_BACKEND=vertex \
+VERTEX_LOCATION=us-central1 \
+VERTEX_MODEL='projects/PROJECT_ID/locations/us-central1/publishers/google/models/MODEL_ID' \
+VERTEX_AUTH=adc \
+cargo run -p gemini-live-cli --features vertex-auth
+```
+
 ## Canonical Behavior
 
 The canonical description of the default CLI session profile now lives in the
 module docs for `crates/gemini-live-cli/src/main.rs`. Keep that source comment
 in sync with the `SetupConfig` built by the CLI entrypoint.
+
+Backend selection and auth-mode semantics are also documented in that module
+doc and enforced by the startup config helpers in the same file.
 
 ## UI Layout
 
@@ -85,6 +108,7 @@ Each slash command group is a separate Cargo feature, all enabled by default:
 | `mic` | `cpal`, `webrtc-audio-processing` | `/mic` command with AEC |
 | `speak` | `cpal`, `webrtc-audio-processing` | `/speak` command with AEC |
 | `share-screen` | `xcap`, `image` | `/share-screen` command |
+| `vertex-auth` | `gemini-live/vertex-auth` | `VERTEX_AUTH=adc` via Google Cloud Application Default Credentials |
 
 Build without audio/screen support for a minimal binary:
 

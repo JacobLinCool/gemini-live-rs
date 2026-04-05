@@ -12,6 +12,7 @@ default = ["mic", "speak", "share-screen"]
 mic = ["dep:cpal", "dep:webrtc-audio-processing"]
 speak = ["dep:cpal", "dep:webrtc-audio-processing"]
 share-screen = ["dep:xcap", "dep:image"]
+vertex-auth = ["gemini-live/vertex-auth"]
 
 [dependencies]
 gemini-live = { workspace = true }

@@ -60,11 +60,15 @@ pub fn into_events(msg: ServerMessage) -> Vec<ServerEvent> {
 
     // 2–4. Server content
     if let Some(sc) = msg.server_content {
-        if let Some(t) = sc.input_transcription {
-            events.push(ServerEvent::InputTranscription(t.text));
+        if let Some(t) = sc.input_transcription
+            && let Some(text) = t.text
+        {
+            events.push(ServerEvent::InputTranscription(text));
         }
-        if let Some(t) = sc.output_transcription {
-            events.push(ServerEvent::OutputTranscription(t.text));
+        if let Some(t) = sc.output_transcription
+            && let Some(text) = t.text
+        {
+            events.push(ServerEvent::OutputTranscription(text));
         }
 
         if let Some(turn) = sc.model_turn {
@@ -315,8 +319,28 @@ mod tests {
         }"#;
         let msg = decode(json).unwrap();
         let sc = msg.server_content.unwrap();
-        assert_eq!(sc.input_transcription.unwrap().text, "What's the weather?");
-        assert_eq!(sc.output_transcription.unwrap().text, "It's sunny today.");
+        assert_eq!(
+            sc.input_transcription.unwrap().text.as_deref(),
+            Some("What's the weather?")
+        );
+        assert_eq!(
+            sc.output_transcription.unwrap().text.as_deref(),
+            Some("It's sunny today.")
+        );
+    }
+
+    #[test]
+    fn decode_transcription_finished_without_text() {
+        let json = r#"{
+            "serverContent": {
+                "outputTranscription": {"finished": true}
+            }
+        }"#;
+        let msg = decode(json).unwrap();
+        let sc = msg.server_content.unwrap();
+        let transcription = sc.output_transcription.unwrap();
+        assert_eq!(transcription.text, None);
+        assert_eq!(transcription.finished, Some(true));
     }
 
     #[test]
@@ -473,6 +497,21 @@ mod tests {
         assert!(matches!(&events[1], ServerEvent::ModelText(t) if t == "hi"));
         assert!(matches!(&events[2], ServerEvent::TurnComplete));
         assert!(matches!(&events[3], ServerEvent::Usage(_)));
+    }
+
+    #[test]
+    fn into_events_ignores_transcription_markers_without_text() {
+        let json = r#"{
+            "serverContent": {
+                "outputTranscription": {"finished": true},
+                "turnComplete": true
+            }
+        }"#;
+        let msg = decode(json).unwrap();
+        let events = into_events(msg);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ServerEvent::TurnComplete));
     }
 
     // ── parse_protobuf_duration ──────────────────────────────────────────

@@ -20,7 +20,10 @@
 | **Session management** | https://ai.google.dev/gemini-api/docs/live-api/session-management |
 | **Ephemeral tokens** | https://ai.google.dev/gemini-api/docs/live-api/ephemeral-tokens |
 | **Deprecations / model lifecycle** | https://ai.google.dev/gemini-api/docs/deprecations |
-| **Vertex AI Live API reference** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/multimodal-live |
+| **Vertex AI Live API overview** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api |
+| **Vertex AI Live session management** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api/start-manage-session |
+| **Vertex AI RPC v1 reference** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rpc/google.cloud.aiplatform.v1 |
+| **Application Default Credentials** | https://docs.cloud.google.com/docs/authentication/application-default-credentials |
 
 ---
 
@@ -32,6 +35,10 @@ wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.G
 
 # Ephemeral token (v1alpha)
 wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token={TOKEN}
+
+# Vertex AI (OAuth 2.0 bearer token)
+wss://{location}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent
+Authorization: Bearer {TOKEN}
 ```
 
 ---

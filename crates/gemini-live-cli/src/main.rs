@@ -10,6 +10,17 @@
 //! - `/share-screen` — share a monitor or window as video
 //! - `@file`         — send an image or audio file inline
 //!
+//! # Backend Selection
+//!
+//! The CLI can target either:
+//!
+//! - the public Gemini API (`LIVE_BACKEND=gemini`, default)
+//! - Vertex AI Live (`LIVE_BACKEND=vertex`)
+//!
+//! Vertex mode requires an explicit `VERTEX_MODEL` and `VERTEX_LOCATION`.
+//! `VERTEX_AUTH=static` uses `VERTEX_AI_ACCESS_TOKEN`. `VERTEX_AUTH=adc`
+//! requires building the CLI with the Cargo feature `vertex-auth`.
+//!
 //! # Current Default Profile
 //!
 //! The CLI currently boots into a single opinionated voice-first profile:
@@ -30,6 +41,7 @@ mod screen;
 mod update;
 
 use std::io;
+use std::{error::Error, fmt};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -43,8 +55,10 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
-use gemini_live::transport::{Auth, TransportConfig};
+use gemini_live::transport::{Auth, Endpoint, TransportConfig};
 use gemini_live::types::*;
+
+const DEFAULT_GEMINI_MODEL: &str = "models/gemini-3.1-flash-live-preview";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,19 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(io::stderr)
         .init();
 
-    let api_key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY environment variable");
-    let model = std::env::var("GEMINI_MODEL")
-        .unwrap_or_else(|_| "models/gemini-3.1-flash-live-preview".into());
+    let startup = resolve_startup_config(|key| std::env::var(key).ok())?;
 
-    eprintln!("connecting to {model}...");
+    eprintln!("connecting to {}...", startup.connection_label());
     let session = Session::connect(SessionConfig {
-        transport: TransportConfig {
-            auth: Auth::ApiKey(api_key),
-            ..Default::default()
-        },
+        transport: startup.transport,
         // The CLI's current built-in profile is intentionally voice-first.
         setup: SetupConfig {
-            model: model.clone(),
+            model: startup.model.clone(),
             generation_config: Some(GenerationConfig {
                 response_modalities: Some(vec![Modality::Audio]),
                 media_resolution: Some(MediaResolution::MediaResolutionHigh),
@@ -97,9 +106,296 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, session, &model).await;
+    let result = run(&mut terminal, session, &startup.model).await;
     restore_terminal(&mut terminal)?;
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Gemini,
+    Vertex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VertexAuthMode {
+    Static,
+    Adc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportPlan {
+    Gemini {
+        api_key: String,
+    },
+    Vertex {
+        location: String,
+        auth: VertexTransportAuthPlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VertexTransportAuthPlan {
+    StaticToken(String),
+    Adc,
+}
+
+#[derive(Debug, Clone)]
+struct StartupConfig {
+    model: String,
+    transport: TransportConfig,
+    backend: Backend,
+    location: Option<String>,
+}
+
+impl StartupConfig {
+    fn connection_label(&self) -> String {
+        match (&self.backend, &self.location) {
+            (Backend::Gemini, _) => self.model.clone(),
+            (Backend::Vertex, Some(location)) => format!("vertex:{location} {}", self.model),
+            (Backend::Vertex, None) => format!("vertex {}", self.model),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CliConfigError(String);
+
+impl CliConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for CliConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for CliConfigError {}
+
+fn resolve_startup_config(
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<StartupConfig, CliConfigError> {
+    let plan = resolve_transport_plan(&env)?;
+    let backend = match &plan {
+        TransportPlan::Gemini { .. } => Backend::Gemini,
+        TransportPlan::Vertex { .. } => Backend::Vertex,
+    };
+    let location = match &plan {
+        TransportPlan::Gemini { .. } => None,
+        TransportPlan::Vertex { location, .. } => Some(location.clone()),
+    };
+    let model = resolve_model(&env, backend)?;
+    let transport = build_transport(plan)?;
+
+    Ok(StartupConfig {
+        model,
+        transport,
+        backend,
+        location,
+    })
+}
+
+fn resolve_transport_plan(
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<TransportPlan, CliConfigError> {
+    match parse_backend(env)? {
+        Backend::Gemini => Ok(TransportPlan::Gemini {
+            api_key: required_env(env, "GEMINI_API_KEY")?,
+        }),
+        Backend::Vertex => Ok(TransportPlan::Vertex {
+            location: required_env(env, "VERTEX_LOCATION")?,
+            auth: match parse_vertex_auth_mode(env)? {
+                VertexAuthMode::Static => VertexTransportAuthPlan::StaticToken(required_env(
+                    env,
+                    "VERTEX_AI_ACCESS_TOKEN",
+                )?),
+                VertexAuthMode::Adc => VertexTransportAuthPlan::Adc,
+            },
+        }),
+    }
+}
+
+fn resolve_model(
+    env: &impl Fn(&str) -> Option<String>,
+    backend: Backend,
+) -> Result<String, CliConfigError> {
+    match backend {
+        Backend::Gemini => Ok(env("GEMINI_MODEL").unwrap_or_else(|| DEFAULT_GEMINI_MODEL.into())),
+        Backend::Vertex => required_env(env, "VERTEX_MODEL"),
+    }
+}
+
+fn parse_backend(env: &impl Fn(&str) -> Option<String>) -> Result<Backend, CliConfigError> {
+    match env("LIVE_BACKEND")
+        .as_deref()
+        .unwrap_or("gemini")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gemini" => Ok(Backend::Gemini),
+        "vertex" => Ok(Backend::Vertex),
+        other => Err(CliConfigError::new(format!(
+            "unsupported LIVE_BACKEND `{other}`; expected `gemini` or `vertex`"
+        ))),
+    }
+}
+
+fn parse_vertex_auth_mode(
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<VertexAuthMode, CliConfigError> {
+    match env("VERTEX_AUTH")
+        .as_deref()
+        .unwrap_or("static")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "static" => Ok(VertexAuthMode::Static),
+        "adc" => Ok(VertexAuthMode::Adc),
+        other => Err(CliConfigError::new(format!(
+            "unsupported VERTEX_AUTH `{other}`; expected `static` or `adc`"
+        ))),
+    }
+}
+
+fn required_env(
+    env: &impl Fn(&str) -> Option<String>,
+    key: &str,
+) -> Result<String, CliConfigError> {
+    env(key)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CliConfigError::new(format!("set {key} environment variable")))
+}
+
+fn build_transport(plan: TransportPlan) -> Result<TransportConfig, CliConfigError> {
+    match plan {
+        TransportPlan::Gemini { api_key } => Ok(TransportConfig {
+            endpoint: Endpoint::GeminiApi,
+            auth: Auth::ApiKey(api_key),
+            ..Default::default()
+        }),
+        TransportPlan::Vertex { location, auth } => Ok(TransportConfig {
+            endpoint: Endpoint::VertexAi { location },
+            auth: build_vertex_auth(auth)?,
+            ..Default::default()
+        }),
+    }
+}
+
+fn build_vertex_auth(auth: VertexTransportAuthPlan) -> Result<Auth, CliConfigError> {
+    match auth {
+        VertexTransportAuthPlan::StaticToken(token) => Ok(Auth::BearerToken(token)),
+        VertexTransportAuthPlan::Adc => build_vertex_adc_auth(),
+    }
+}
+
+#[cfg(feature = "vertex-auth")]
+fn build_vertex_adc_auth() -> Result<Auth, CliConfigError> {
+    Auth::vertex_ai_application_default()
+        .map_err(|e| CliConfigError::new(format!("failed to initialize Vertex ADC auth: {e}")))
+}
+
+#[cfg(not(feature = "vertex-auth"))]
+fn build_vertex_adc_auth() -> Result<Auth, CliConfigError> {
+    Err(CliConfigError::new(
+        "VERTEX_AUTH=adc requires building gemini-live-cli with --features vertex-auth",
+    ))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars = vars
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<HashMap<_, _>>();
+        move |key| vars.get(key).cloned()
+    }
+
+    #[test]
+    fn gemini_backend_defaults_model() {
+        let startup =
+            resolve_startup_config(env(&[("GEMINI_API_KEY", "test-key")])).expect("startup config");
+
+        assert_eq!(startup.model, DEFAULT_GEMINI_MODEL);
+        assert_eq!(startup.backend, Backend::Gemini);
+        assert!(startup.location.is_none());
+        assert!(matches!(startup.transport.endpoint, Endpoint::GeminiApi));
+        assert!(matches!(startup.transport.auth, Auth::ApiKey(_)));
+    }
+
+    #[test]
+    fn vertex_backend_requires_explicit_model() {
+        let err = resolve_startup_config(env(&[
+            ("LIVE_BACKEND", "vertex"),
+            ("VERTEX_LOCATION", "us-central1"),
+            ("VERTEX_AI_ACCESS_TOKEN", "token"),
+        ]))
+        .expect_err("missing model should fail");
+
+        assert_eq!(err.to_string(), "set VERTEX_MODEL environment variable");
+    }
+
+    #[test]
+    fn vertex_backend_static_token_path_builds_transport() {
+        let startup = resolve_startup_config(env(&[
+            ("LIVE_BACKEND", "vertex"),
+            ("VERTEX_LOCATION", "us-central1"),
+            (
+                "VERTEX_MODEL",
+                "projects/p/locations/us-central1/publishers/google/models/test",
+            ),
+            ("VERTEX_AI_ACCESS_TOKEN", "token"),
+        ]))
+        .expect("startup config");
+
+        assert_eq!(startup.backend, Backend::Vertex);
+        assert_eq!(startup.location.as_deref(), Some("us-central1"));
+        assert!(matches!(
+            startup.transport.endpoint,
+            Endpoint::VertexAi { ref location } if location == "us-central1"
+        ));
+        assert!(matches!(startup.transport.auth, Auth::BearerToken(_)));
+    }
+
+    #[test]
+    fn unsupported_backend_is_rejected() {
+        let err = resolve_startup_config(env(&[
+            ("LIVE_BACKEND", "other"),
+            ("GEMINI_API_KEY", "test-key"),
+        ]))
+        .expect_err("unsupported backend should fail");
+
+        assert!(err.to_string().contains("unsupported LIVE_BACKEND"));
+    }
+
+    #[cfg(not(feature = "vertex-auth"))]
+    #[test]
+    fn vertex_adc_requires_feature() {
+        let err = resolve_startup_config(env(&[
+            ("LIVE_BACKEND", "vertex"),
+            ("VERTEX_LOCATION", "us-central1"),
+            (
+                "VERTEX_MODEL",
+                "projects/p/locations/us-central1/publishers/google/models/test",
+            ),
+            ("VERTEX_AUTH", "adc"),
+        ]))
+        .expect_err("adc should require feature");
+
+        assert_eq!(
+            err.to_string(),
+            "VERTEX_AUTH=adc requires building gemini-live-cli with --features vertex-auth"
+        );
+    }
 }
 
 // ── Terminal ─────────────────────────────────────────────────────────────────

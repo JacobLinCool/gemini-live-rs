@@ -15,6 +15,7 @@ High-performance Rust client for the [Gemini Multimodal Live API](https://ai.goo
 - **Performance-conscious** — zero-allocation `AudioEncoder` for the hot path; buffer-reuse design throughout
 - **Tool calling** — built-in support for function calls, cancellations, and scheduling modes
 - **Clone-friendly sessions** — `Session` is cheaply cloneable; multiple tasks can send and receive concurrently
+- **Vertex-ready transport** — first-class Vertex AI Live routing via regional endpoints and bearer-token auth
 
 ## Quick Start
 
@@ -60,6 +61,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+```
+
+## Vertex AI
+
+Use the Vertex transport endpoint with an OAuth access token. `setup.model`
+must be the full Vertex model resource name.
+
+```rust
+use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
+use gemini_live::transport::{Auth, Endpoint, TransportConfig};
+use gemini_live::types::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = Session::connect(SessionConfig {
+        transport: TransportConfig {
+            endpoint: Endpoint::VertexAi {
+                location: "us-central1".into(),
+            },
+            auth: Auth::BearerToken(std::env::var("VERTEX_AI_ACCESS_TOKEN")?),
+            ..Default::default()
+        },
+        setup: SetupConfig {
+            model: std::env::var("VERTEX_MODEL")?,
+            generation_config: Some(GenerationConfig {
+                response_modalities: Some(vec![Modality::Text]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        reconnect: ReconnectPolicy::default(),
+    }).await?;
+
+    session.send_text("Hello from Vertex!").await?;
+    drop(session);
+    Ok(())
+}
+```
+
+If you want reconnect-safe token refresh from Google Cloud Application Default
+Credentials, enable the optional `vertex-auth` feature:
+
+```toml
+[dependencies]
+gemini-live = { version = "0.1", features = ["vertex-auth"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Then build the auth mode from ADC instead of injecting a static token:
+
+```rust
+use gemini_live::transport::Auth;
+
+let auth = Auth::vertex_ai_application_default()?;
 ```
 
 ## Architecture
@@ -157,6 +212,26 @@ Override the model:
 
 ```bash
 GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest gemini-live
+```
+
+Run the CLI against Vertex AI with a static bearer token:
+
+```bash
+LIVE_BACKEND=vertex \
+VERTEX_LOCATION=us-central1 \
+VERTEX_MODEL='projects/PROJECT_ID/locations/us-central1/publishers/google/models/MODEL_ID' \
+VERTEX_AI_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)" \
+gemini-live
+```
+
+Run the CLI against Vertex AI with Application Default Credentials:
+
+```bash
+LIVE_BACKEND=vertex \
+VERTEX_LOCATION=us-central1 \
+VERTEX_MODEL='projects/PROJECT_ID/locations/us-central1/publishers/google/models/MODEL_ID' \
+VERTEX_AUTH=adc \
+cargo run -p gemini-live-cli --features vertex-auth
 ```
 
 ### Commands

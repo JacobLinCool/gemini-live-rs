@@ -57,6 +57,42 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! For Vertex AI, switch the transport endpoint and auth mode:
+//!
+//! ```rust,no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
+//! use gemini_live::transport::{Auth, Endpoint, TransportConfig};
+//! use gemini_live::types::*;
+//!
+//! let mut session = Session::connect(SessionConfig {
+//!     transport: TransportConfig {
+//!         endpoint: Endpoint::VertexAi {
+//!             location: "us-central1".into(),
+//!         },
+//!         auth: Auth::BearerToken(std::env::var("VERTEX_AI_ACCESS_TOKEN")?),
+//!         ..Default::default()
+//!     },
+//!     setup: SetupConfig {
+//!         model: std::env::var("VERTEX_MODEL")?,
+//!         generation_config: Some(GenerationConfig {
+//!             response_modalities: Some(vec![Modality::Text]),
+//!             ..Default::default()
+//!         }),
+//!         ..Default::default()
+//!     },
+//!     reconnect: ReconnectPolicy::default(),
+//! })
+//! .await?;
+//! # drop(session);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Enable the optional `vertex-auth` crate feature if you want the library to
+//! obtain Vertex bearer tokens from Google Cloud Application Default
+//! Credentials instead of passing a static token string.
 
 pub mod audio;
 pub mod codec;
@@ -68,5 +104,7 @@ pub mod types;
 // Re-export the most commonly used items at the crate root for convenience.
 pub use error::*;
 pub use session::{ReconnectPolicy, Session, SessionConfig, SessionStatus};
-pub use transport::{Auth, Connection, RawFrame, TransportConfig};
+#[cfg(feature = "vertex-auth")]
+pub use transport::VertexAiApplicationDefaultCredentials;
+pub use transport::{Auth, BearerTokenProvider, Connection, Endpoint, RawFrame, TransportConfig};
 pub use types::*;

@@ -60,9 +60,17 @@ pub struct ServerContent {
     pub url_context_metadata: Option<serde_json::Value>,
 }
 
+/// Partial audio-transcription update from the server.
+///
+/// Vertex AI `v1` marks both fields as optional. The server may send a
+/// terminal transcription marker with `finished=true` and no `text`, so the
+/// client must not require text to be present on every update.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Transcription {
-    pub text: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub finished: Option<bool>,
 }
 
 // ── Tool call ────────────────────────────────────────────────────────────────

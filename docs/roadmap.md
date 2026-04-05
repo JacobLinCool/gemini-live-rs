@@ -25,7 +25,7 @@ Missing or incomplete functionality relative to the upstream API.
 | ID | Item | Description | Priority |
 |----|------|-------------|----------|
 | F-1 | Ephemeral token fetching | `Auth::EphemeralToken` accepts a token string but there's no helper to obtain one from the REST API. Add an optional `reqwest`-based helper (behind a feature flag). `reqwest` is already in workspace deps. | Medium |
-| F-2 | Vertex AI endpoint support | `endpoint_override` exists as an escape hatch, but there's no first-class `Auth::VertexAI` variant with service-account auth. | Low |
+| F-2 | Vertex AI schema parity and integration coverage | First-class transport routing and ADC-backed bearer refresh now exist, but the Vertex `v1` schema audit is still incomplete and there are no live Vertex integration tests yet. | Medium |
 | F-3 | Configurable setup timeout | Setup handshake timeout is hardcoded to 30 s (`SETUP_TIMEOUT` in `session.rs`). Should be configurable via `SessionConfig`. | Low |
 | F-4 | Graceful shutdown propagation | `Session::close()` sends a close command but doesn't await the runner task to finish. Consider returning a `JoinHandle` or awaiting completion. | Low |
 | F-5 | `Stream` trait for `Session` | `events()` returns `impl Stream` via `unfold`, but `Session` itself doesn't implement `Stream`. Evaluate whether implementing `Stream<Item = ServerEvent>` directly on `Session` would be ergonomic. | Low |

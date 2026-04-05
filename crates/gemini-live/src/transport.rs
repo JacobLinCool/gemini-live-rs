@@ -5,42 +5,206 @@
 //! protocol.  The [`session`](crate::session) layer wraps [`Connection`] to
 //! add protocol-level concerns.
 //!
-//! # Endpoints
+//! # Endpoint and Auth Routing
 //!
-//! | Auth method     | Endpoint                                                                                                                   |
-//! |-----------------|----------------------------------------------------------------------------------------------------------------------------|
-//! | API key         | `wss://generativelanguage.googleapis.com/ws/…v1beta.GenerativeService.BidiGenerateContent?key={KEY}`                        |
-//! | Ephemeral token | `wss://generativelanguage.googleapis.com/ws/…v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token={TOKEN}` |
+//! Transport routing is modeled as two orthogonal choices:
 //!
-//! Both can be overridden via [`TransportConfig::endpoint_override`] for
-//! testing or Vertex AI endpoints.
+//! - [`Endpoint`] chooses the WebSocket host and RPC path.
+//! - [`Auth`] chooses how credentials are attached to the handshake request.
+//!
+//! The currently supported first-class combinations are:
+//!
+//! | Endpoint | Auth | Wire behavior |
+//! |---|---|---|
+//! | [`Endpoint::GeminiApi`] | [`Auth::ApiKey`] | `wss://generativelanguage.googleapis.com/ws/…v1beta.GenerativeService.BidiGenerateContent?key=…` |
+//! | [`Endpoint::GeminiApi`] | [`Auth::EphemeralToken`] | `wss://generativelanguage.googleapis.com/ws/…v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=…` |
+//! | [`Endpoint::VertexAi`] | [`Auth::BearerToken`] or [`Auth::BearerTokenProvider`] | `wss://{location}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent` + `Authorization: Bearer …` |
+//!
+//! [`Endpoint::Custom`] is the explicit escape hatch for tests, proxies, and
+//! already-routed deployments.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Request, header::AUTHORIZATION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
+use url::Url;
 
-use crate::error::{ConnectError, RecvError, SendError};
+use crate::error::{BearerTokenError, ConnectError, RecvError, SendError};
 
-const DEFAULT_HOST: &str = "wss://generativelanguage.googleapis.com";
-const API_KEY_PATH: &str =
+#[cfg(feature = "vertex-auth")]
+mod vertex_auth;
+
+#[cfg(feature = "vertex-auth")]
+pub use vertex_auth::VertexAiApplicationDefaultCredentials;
+
+const GEMINI_API_HOST: &str = "wss://generativelanguage.googleapis.com";
+const GEMINI_API_KEY_PATH: &str =
     "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-const EPHEMERAL_TOKEN_PATH: &str =
+const GEMINI_EPHEMERAL_TOKEN_PATH: &str =
     "/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained";
+const VERTEX_AI_PATH: &str = "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent";
+
+// ── Endpoint ────────────────────────────────────────────────────────────────
+
+/// WebSocket endpoint family.
+///
+/// This type is the canonical home for transport-level routing semantics.
+/// It selects the host and RPC path only. Credential attachment is controlled
+/// separately via [`Auth`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Endpoint {
+    /// Public Gemini API Live endpoint on `generativelanguage.googleapis.com`.
+    #[default]
+    GeminiApi,
+    /// Vertex AI Live endpoint pinned to the current `v1` RPC path.
+    ///
+    /// `setup.model` must use the full Vertex resource name, for example:
+    /// `projects/{project}/locations/{location}/publishers/google/models/{model}`.
+    VertexAi { location: String },
+    /// Explicit raw WebSocket URL for tests, proxies, or custom deployments.
+    Custom(String),
+}
+
+// ── BearerTokenProvider ──────────────────────────────────────────────────────
+
+type BearerTokenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, BearerTokenError>> + Send + 'a>>;
+
+trait DynBearerTokenProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn bearer_token(&self) -> BearerTokenFuture<'_>;
+}
+
+struct FnBearerTokenProvider<F> {
+    name: &'static str,
+    func: F,
+}
+
+impl<F, Fut> DynBearerTokenProvider for FnBearerTokenProvider<F>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, BearerTokenError>> + Send + 'static,
+{
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn bearer_token(&self) -> BearerTokenFuture<'_> {
+        Box::pin((self.func)())
+    }
+}
+
+/// Refreshable bearer-token source for header-authenticated endpoints.
+///
+/// The provider is queried on every WebSocket connect attempt. Implementations
+/// should therefore handle their own token caching and refresh behavior if the
+/// underlying token source is expensive or rate limited.
+#[derive(Clone)]
+pub struct BearerTokenProvider {
+    inner: Arc<dyn DynBearerTokenProvider>,
+}
+
+impl BearerTokenProvider {
+    fn new<P>(provider: P) -> Self
+    where
+        P: DynBearerTokenProvider + 'static,
+    {
+        Self {
+            inner: Arc::new(provider),
+        }
+    }
+
+    /// Create a provider from an async function or closure.
+    pub fn from_fn<F, Fut>(name: &'static str, func: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, BearerTokenError>> + Send + 'static,
+    {
+        Self::new(FnBearerTokenProvider { name, func })
+    }
+
+    /// Fetch a bearer token for the next connection attempt.
+    pub async fn bearer_token(&self) -> Result<String, BearerTokenError> {
+        self.inner.bearer_token().await
+    }
+
+    #[cfg(feature = "vertex-auth")]
+    /// Create a provider backed by Google Cloud Application Default
+    /// Credentials with the `cloud-platform` scope.
+    pub fn vertex_ai_application_default() -> Result<Self, BearerTokenError> {
+        Ok(VertexAiApplicationDefaultCredentials::new()?.into_bearer_token_provider())
+    }
+}
+
+impl std::fmt::Debug for BearerTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerTokenProvider")
+            .field("kind", &self.inner.name())
+            .finish()
+    }
+}
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
-/// Authentication method for the Gemini Live API.
-#[derive(Debug, Clone)]
+/// Authentication method for the WebSocket handshake.
+#[derive(Clone)]
 pub enum Auth {
+    /// Send no credentials.
+    ///
+    /// This is mainly useful with [`Endpoint::Custom`] when targeting a mock
+    /// server, a local test harness, or a proxy that already performs auth.
+    None,
     /// Standard long-lived API key (sent as `?key=` query param).
     ApiKey(String),
     /// Short-lived token obtained via the ephemeral token endpoint (v1alpha).
     EphemeralToken(String),
+    /// OAuth 2.0 bearer token sent via the `Authorization` header.
+    ///
+    /// This is the first-class auth mode for [`Endpoint::VertexAi`].
+    BearerToken(String),
+    /// Refreshable bearer-token provider.
+    ///
+    /// Use this for endpoints such as Vertex AI where reconnect logic should
+    /// obtain a fresh token instead of reusing a previously captured string.
+    BearerTokenProvider(BearerTokenProvider),
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.debug_tuple("None").finish(),
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"<redacted>").finish(),
+            Self::EphemeralToken(_) => f
+                .debug_tuple("EphemeralToken")
+                .field(&"<redacted>")
+                .finish(),
+            Self::BearerToken(_) => f.debug_tuple("BearerToken").field(&"<redacted>").finish(),
+            Self::BearerTokenProvider(provider) => f
+                .debug_tuple("BearerTokenProvider")
+                .field(provider)
+                .finish(),
+        }
+    }
+}
+
+impl Auth {
+    #[cfg(feature = "vertex-auth")]
+    /// Build Vertex-compatible bearer auth from Google Cloud Application
+    /// Default Credentials with the `cloud-platform` scope.
+    pub fn vertex_ai_application_default() -> Result<Self, BearerTokenError> {
+        Ok(Self::BearerTokenProvider(
+            BearerTokenProvider::vertex_ai_application_default()?,
+        ))
+    }
 }
 
 // ── TransportConfig ──────────────────────────────────────────────────────────
@@ -48,12 +212,14 @@ pub enum Auth {
 /// Transport layer settings.
 ///
 /// All fields have sensible defaults (see [`Default`] impl).  In most cases
-/// only [`auth`](Self::auth) needs to be set explicitly.
+/// [`endpoint`](Self::endpoint) and [`auth`](Self::auth) are the only
+/// fields that need to be set explicitly.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
+    /// WebSocket host and RPC path family.
+    pub endpoint: Endpoint,
+    /// Handshake credential strategy.
     pub auth: Auth,
-    /// Override the default endpoint (for testing or Vertex AI).
-    pub endpoint_override: Option<String>,
     /// WebSocket write buffer size in bytes.  Default: 1 MB.
     pub write_buffer_size: usize,
     /// Maximum WebSocket frame size in bytes.  Default: 16 MB.
@@ -65,8 +231,8 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            auth: Auth::ApiKey(String::new()),
-            endpoint_override: None,
+            endpoint: Endpoint::GeminiApi,
+            auth: Auth::None,
             write_buffer_size: 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             connect_timeout: Duration::from_secs(10),
@@ -104,17 +270,16 @@ pub struct Connection {
 impl Connection {
     /// Establish a WebSocket connection (does **not** send the `setup` message).
     pub async fn connect(config: &TransportConfig) -> Result<Self, ConnectError> {
-        // Ensure a rustls CryptoProvider is installed (idempotent).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        install_rustls_crypto_provider();
 
-        let url = build_url(config);
+        let request = build_request(config).await?;
         let mut ws_config = WebSocketConfig::default();
         ws_config.write_buffer_size = config.write_buffer_size;
         ws_config.max_write_buffer_size = config.write_buffer_size * 2;
         ws_config.max_frame_size = Some(config.max_frame_size);
         ws_config.max_message_size = Some(config.max_frame_size);
 
-        let connect_fut = connect_async_with_config(url, Some(ws_config), false);
+        let connect_fut = connect_async_with_config(request, Some(ws_config), false);
 
         let (ws_stream, _response) = tokio::time::timeout(config.connect_timeout, connect_fut)
             .await
@@ -181,15 +346,118 @@ impl Connection {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn build_url(config: &TransportConfig) -> String {
-    if let Some(url) = &config.endpoint_override {
-        return url.clone();
+pub(crate) fn install_rustls_crypto_provider() {
+    // Idempotent. Needed both for WebSocket TLS and feature-gated token
+    // helpers that perform HTTPS token refreshes before the socket exists.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+async fn build_request(config: &TransportConfig) -> Result<Request<()>, ConnectError> {
+    validate_transport_config(config)?;
+
+    let url = build_url(config)?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| ConnectError::Config(format!("invalid websocket request: {e}")))?;
+
+    if let Some(header) = build_bearer_header(&config.auth).await? {
+        request.headers_mut().insert(AUTHORIZATION, header);
     }
-    match &config.auth {
-        Auth::ApiKey(key) => format!("{DEFAULT_HOST}{API_KEY_PATH}?key={key}"),
-        Auth::EphemeralToken(token) => {
-            format!("{DEFAULT_HOST}{EPHEMERAL_TOKEN_PATH}?access_token={token}")
+
+    Ok(request)
+}
+
+fn validate_transport_config(config: &TransportConfig) -> Result<(), ConnectError> {
+    match (&config.endpoint, &config.auth) {
+        (Endpoint::GeminiApi, Auth::ApiKey(_) | Auth::EphemeralToken(_)) => Ok(()),
+        (Endpoint::GeminiApi, Auth::None) => Err(ConnectError::Config(
+            "Endpoint::GeminiApi requires Auth::ApiKey or Auth::EphemeralToken".into(),
+        )),
+        (Endpoint::GeminiApi, Auth::BearerToken(_) | Auth::BearerTokenProvider(_)) => Err(
+            ConnectError::Config(
+                "Endpoint::GeminiApi does not use bearer auth; use Auth::ApiKey or Auth::EphemeralToken".into(),
+            ),
+        ),
+        (
+            Endpoint::VertexAi { location },
+            Auth::BearerToken(_) | Auth::BearerTokenProvider(_),
+        ) => {
+            if location.trim().is_empty() {
+                return Err(ConnectError::Config(
+                    "Endpoint::VertexAi location must not be empty".into(),
+                ));
+            }
+            Ok(())
         }
+        (Endpoint::VertexAi { .. }, _) => Err(ConnectError::Config(
+            "Endpoint::VertexAi requires Auth::BearerToken or Auth::BearerTokenProvider"
+                .into(),
+        )),
+        (Endpoint::Custom(url), _) => {
+            Url::parse(url).map_err(|e| ConnectError::Config(format!("invalid custom endpoint URL: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+fn build_url(config: &TransportConfig) -> Result<Url, ConnectError> {
+    let mut url = match &config.endpoint {
+        Endpoint::GeminiApi => {
+            Url::parse(&format!(
+                "{}{}",
+                GEMINI_API_HOST,
+                gemini_path_for_auth(&config.auth)
+            ))
+        }
+        .map_err(|e| ConnectError::Config(format!("invalid Gemini API endpoint URL: {e}")))?,
+        Endpoint::VertexAi { location } => Url::parse(&format!(
+            "wss://{location}-aiplatform.googleapis.com{VERTEX_AI_PATH}"
+        ))
+        .map_err(|e| ConnectError::Config(format!("invalid Vertex AI endpoint URL: {e}")))?,
+        Endpoint::Custom(url) => Url::parse(url)
+            .map_err(|e| ConnectError::Config(format!("invalid custom endpoint URL: {e}")))?,
+    };
+
+    match &config.auth {
+        Auth::ApiKey(key) => {
+            url.query_pairs_mut().append_pair("key", key);
+        }
+        Auth::EphemeralToken(token) => {
+            url.query_pairs_mut().append_pair("access_token", token);
+        }
+        Auth::None | Auth::BearerToken(_) | Auth::BearerTokenProvider(_) => {}
+    }
+
+    Ok(url)
+}
+
+fn gemini_path_for_auth(auth: &Auth) -> &'static str {
+    match auth {
+        Auth::EphemeralToken(_) => GEMINI_EPHEMERAL_TOKEN_PATH,
+        Auth::None | Auth::ApiKey(_) | Auth::BearerToken(_) | Auth::BearerTokenProvider(_) => {
+            GEMINI_API_KEY_PATH
+        }
+    }
+}
+
+async fn build_bearer_header(auth: &Auth) -> Result<Option<HeaderValue>, ConnectError> {
+    match auth {
+        Auth::BearerToken(token) => HeaderValue::from_str(&format!("Bearer {token}"))
+            .map(Some)
+            .map_err(|e| ConnectError::Config(format!("invalid bearer token header: {e}"))),
+        Auth::BearerTokenProvider(provider) => {
+            let token = provider.bearer_token().await.map_err(ConnectError::Auth)?;
+            HeaderValue::from_str(&format!("Bearer {token}"))
+                .map(Some)
+                .map_err(|e| {
+                    ConnectError::Auth(BearerTokenError::with_source(
+                        "token provider returned an invalid bearer token",
+                        e,
+                    ))
+                })
+        }
+        Auth::None | Auth::ApiKey(_) | Auth::EphemeralToken(_) => Ok(None),
     }
 }
 
@@ -213,48 +481,175 @@ fn classify_send_error(e: tungstenite::Error) -> SendError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
-    #[test]
-    fn url_api_key() {
+    #[tokio::test]
+    async fn request_gemini_api_key_uses_query_auth() {
         let config = TransportConfig {
+            endpoint: Endpoint::GeminiApi,
             auth: Auth::ApiKey("test-key-123".into()),
             ..Default::default()
         };
-        let url = build_url(&config);
-        assert!(url.starts_with("wss://generativelanguage.googleapis.com"));
-        assert!(url.contains("BidiGenerateContent?key=test-key-123"));
-        assert!(!url.contains("v1alpha"));
+        let request = build_request(&config).await.expect("request");
+        let uri = request.uri().to_string();
+
+        assert!(uri.starts_with("wss://generativelanguage.googleapis.com"));
+        assert!(uri.contains("BidiGenerateContent?key=test-key-123"));
+        assert!(!uri.contains("v1alpha"));
+        assert!(request.headers().get(AUTHORIZATION).is_none());
     }
 
-    #[test]
-    fn url_ephemeral_token() {
+    #[tokio::test]
+    async fn request_gemini_ephemeral_token_uses_constrained_path() {
         let config = TransportConfig {
+            endpoint: Endpoint::GeminiApi,
             auth: Auth::EphemeralToken("tok-abc".into()),
             ..Default::default()
         };
-        let url = build_url(&config);
-        assert!(url.contains("v1alpha"));
-        assert!(url.contains("BidiGenerateContentConstrained?access_token=tok-abc"));
+        let request = build_request(&config).await.expect("request");
+        let uri = request.uri().to_string();
+
+        assert!(uri.contains("v1alpha"));
+        assert!(uri.contains("BidiGenerateContentConstrained?access_token=tok-abc"));
+        assert!(request.headers().get(AUTHORIZATION).is_none());
     }
 
-    #[test]
-    fn url_endpoint_override() {
+    #[tokio::test]
+    async fn request_vertex_ai_uses_bearer_header() {
         let config = TransportConfig {
-            auth: Auth::ApiKey("ignored".into()),
-            endpoint_override: Some("wss://custom.example.com/ws".into()),
+            endpoint: Endpoint::VertexAi {
+                location: "us-central1".into(),
+            },
+            auth: Auth::BearerToken("vertex-token".into()),
             ..Default::default()
         };
-        let url = build_url(&config);
-        assert_eq!(url, "wss://custom.example.com/ws");
+        let request = build_request(&config).await.expect("request");
+
+        assert_eq!(
+            request.uri(),
+            "wss://us-central1-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .expect("authorization header"),
+            "Bearer vertex-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_custom_endpoint_can_skip_auth() {
+        let config = TransportConfig {
+            endpoint: Endpoint::Custom("wss://custom.example.com/ws".into()),
+            auth: Auth::None,
+            ..Default::default()
+        };
+        let request = build_request(&config).await.expect("request");
+
+        assert_eq!(request.uri(), "wss://custom.example.com/ws");
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn request_vertex_ai_provider_fetches_token_per_connect() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = BearerTokenProvider::from_fn("test-sequence", {
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let next = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok(format!("token-{next}"))
+                }
+            }
+        });
+
+        let config = TransportConfig {
+            endpoint: Endpoint::VertexAi {
+                location: "us-central1".into(),
+            },
+            auth: Auth::BearerTokenProvider(provider),
+            ..Default::default()
+        };
+
+        let first = build_request(&config).await.expect("first request");
+        let second = build_request(&config).await.expect("second request");
+
+        assert_eq!(
+            first.headers().get(AUTHORIZATION).expect("first auth"),
+            "Bearer token-1"
+        );
+        assert_eq!(
+            second.headers().get(AUTHORIZATION).expect("second auth"),
+            "Bearer token-2"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn request_vertex_ai_provider_error_bubbles() {
+        let config = TransportConfig {
+            endpoint: Endpoint::VertexAi {
+                location: "us-central1".into(),
+            },
+            auth: Auth::BearerTokenProvider(BearerTokenProvider::from_fn(
+                "always-fails",
+                || async { Err(BearerTokenError::new("boom")) },
+            )),
+            ..Default::default()
+        };
+
+        let err = build_request(&config)
+            .await
+            .expect_err("provider failure should bubble");
+
+        assert!(matches!(err, ConnectError::Auth(source) if source.to_string() == "boom"));
+    }
+
+    #[tokio::test]
+    async fn invalid_vertex_auth_is_rejected_before_connect() {
+        let config = TransportConfig {
+            endpoint: Endpoint::VertexAi {
+                location: "us-central1".into(),
+            },
+            auth: Auth::ApiKey("not-vertex".into()),
+            ..Default::default()
+        };
+        let err = build_request(&config).await.expect_err("config error");
+
+        assert!(
+            matches!(err, ConnectError::Config(message) if message == "Endpoint::VertexAi requires Auth::BearerToken or Auth::BearerTokenProvider")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_gemini_bearer_auth_is_rejected_before_connect() {
+        let config = TransportConfig {
+            endpoint: Endpoint::GeminiApi,
+            auth: Auth::BearerTokenProvider(BearerTokenProvider::from_fn("wrong", || async {
+                Ok("wrong".into())
+            })),
+            ..Default::default()
+        };
+        let err = build_request(&config).await.expect_err("config error");
+
+        assert!(
+            matches!(err, ConnectError::Config(message) if message.contains("does not use bearer auth"))
+        );
     }
 
     #[test]
     fn default_config_values() {
         let config = TransportConfig::default();
+
+        assert_eq!(config.endpoint, Endpoint::GeminiApi);
+        assert!(matches!(config.auth, Auth::None));
         assert_eq!(config.write_buffer_size, 1024 * 1024);
         assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
-        assert!(config.endpoint_override.is_none());
     }
 }

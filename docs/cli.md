@@ -90,6 +90,12 @@ spaces are not supported yet.
 | `/share-screen list` | List available capture targets (monitors and windows) with IDs. |
 | `/share-screen <id> [interval]` | Start sharing a monitor or window. `interval` is seconds between frames (default: 1). Example: `/share-screen 0 5` shares Display 1 every 5 seconds. |
 | `/share-screen` | Stop screen sharing (when active). |
+| `/tools` | Show active vs staged tool profile. |
+| `/tools list` | List the known tools and their current state (`active`, `staged`, `off`). |
+| `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `list-files`, `read-file`, `run-command`. |
+| `/tools disable <tool>` | Stage a tool removal for the next applied session. |
+| `/tools toggle <tool>` | Flip a tool in the staged profile. |
+| `/tools apply` | Open a fresh Live session using the staged tool profile. |
 
 ### Keyboard
 
@@ -137,5 +143,12 @@ stream audio/video simultaneously without any of these blocking each other.
 ## Current Limitations
 
 See `crates/gemini-live-cli/src/main.rs` for code-adjacent notes about the
-default profile and current tool-execution gap. This file is intentionally kept
-as an entry guide rather than the canonical home of runtime behavior.
+default profile and current tool behavior. This file is intentionally kept as
+an entry guide rather than the canonical home of runtime behavior.
+
+- Tool-profile changes are session-level and therefore require `/tools apply`.
+- `/tools apply` currently starts a fresh session instead of resuming server
+  conversation state.
+- Local tools are intentionally narrow: `read-file` only reads UTF-8 text,
+  `list-files` stays inside the current workspace root, and `run-command`
+  executes argv-only commands without a shell.

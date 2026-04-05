@@ -8,16 +8,16 @@
 
 | Level | Test item | Count |
 |---|---|---|
-| **Unit** | Codec: serialize / deserialize round-trip | 20 |
+| **Unit** | Codec: serialize / deserialize round-trip | 22 |
 | **Unit** | AudioEncoder: f32/i16 → base64 correctness | 5 |
 | **Unit** | ReconnectPolicy: backoff calculation | 1 |
 | **Unit** | Session: status encoding, resume handle tracking | 3 |
 | **Unit** | Transport: URL construction, default config | 4 |
-| **Unit** | CLI | 0 |
-| **Doc** | `lib.rs` usage example, `AudioEncoder` example | 3 |
+| **Unit** | CLI: startup config + `/tools` parser/catalog | 9 |
+| **Doc** | `lib.rs` usage example, `AudioEncoder` example | 4 |
 | **Bench** | Criterion hot-path suite (`cargo bench -p gemini-live`) | 1 |
 
-**Total: 36 library unit + 0 CLI unit + 3 doc tests + 1 benchmark suite**
+**Total: 45 library unit + 9 CLI unit + 4 doc tests + 1 benchmark suite**
 
 ## Running Tests
 

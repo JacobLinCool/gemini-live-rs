@@ -8,6 +8,7 @@
 //! - `/mic`          — toggle microphone streaming
 //! - `/speak`        — toggle audio playback of model responses
 //! - `/share-screen` — share a monitor or window as video
+//! - `/tools ...`    — inspect, stage, and apply the Live tool profile
 //! - `@file`         — send an image or audio file inline
 //!
 //! # Backend Selection
@@ -28,7 +29,8 @@
 //! - `responseModalities = ["AUDIO"]`
 //! - `inputAudioTranscription = {}`
 //! - `outputAudioTranscription = {}`
-//! - no first-class Live API tool execution yet
+//! - no tools enabled by default; `/tools apply` reconnects with the staged
+//!   tool profile
 //!
 //! This module doc is the canonical home for the default CLI session profile.
 //! Keep it in sync with the `SetupConfig` built in `main()`.
@@ -38,8 +40,10 @@ mod audio_io;
 mod media;
 #[cfg(feature = "share-screen")]
 mod screen;
+mod tooling;
 mod update;
 
+use std::collections::HashMap;
 use std::io;
 use std::{error::Error, fmt};
 
@@ -53,6 +57,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
 use gemini_live::transport::{Auth, Endpoint, TransportConfig};
@@ -85,28 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let startup = resolve_startup_config(|key| std::env::var(key).ok())?;
 
-    eprintln!("connecting to {}...", startup.connection_label());
-    let session = Session::connect(SessionConfig {
-        transport: startup.transport,
-        // The CLI's current built-in profile is intentionally voice-first.
-        setup: SetupConfig {
-            model: startup.model.clone(),
-            generation_config: Some(GenerationConfig {
-                response_modalities: Some(vec![Modality::Audio]),
-                media_resolution: Some(MediaResolution::MediaResolutionHigh),
-                ..Default::default()
-            }),
-            input_audio_transcription: Some(AudioTranscriptionConfig {}),
-            output_audio_transcription: Some(AudioTranscriptionConfig {}),
-            ..Default::default()
-        },
-        reconnect: ReconnectPolicy::default(),
-    })
-    .await?;
-
     install_panic_hook();
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, session, &startup.model).await;
+    let result = run(&mut terminal, startup).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -433,6 +419,8 @@ struct App {
     input: String,
     quit: bool,
     title: String,
+    active_tools: tooling::ToolProfile,
+    desired_tools: tooling::ToolProfile,
     #[cfg(feature = "mic")]
     mic_on: bool,
     #[cfg(feature = "speak")]
@@ -454,17 +442,31 @@ enum Role {
     System,
 }
 
+enum AppEvent {
+    Server {
+        generation: u64,
+        event: ServerEvent,
+    },
+    ToolFinished {
+        generation: u64,
+        call_id: String,
+        message: String,
+    },
+}
+
 impl App {
-    fn new(model: &str) -> Self {
+    fn new(title: &str, tools: tooling::ToolProfile) -> Self {
         Self {
             messages: vec![Msg {
                 role: Role::System,
-                text: "connected — @file for media, /mic /speak to toggle audio, /share-screen to share screen".to_string(),
+                text: "connected — @file for media, /mic /speak to toggle audio, /share-screen to share screen, /tools to manage Live tools".to_string(),
             }],
             pending: String::new(),
             input: String::new(),
             quit: false,
-            title: model.to_string(),
+            title: title.to_string(),
+            active_tools: tools,
+            desired_tools: tools,
             #[cfg(feature = "mic")]
             mic_on: false,
             #[cfg(feature = "speak")]
@@ -482,25 +484,92 @@ impl App {
     }
 }
 
+async fn connect_session(
+    startup: &StartupConfig,
+    tools: tooling::ToolProfile,
+) -> Result<Session, gemini_live::SessionError> {
+    Session::connect(SessionConfig {
+        transport: startup.transport.clone(),
+        // The CLI's current built-in profile is intentionally voice-first.
+        setup: SetupConfig {
+            model: startup.model.clone(),
+            generation_config: Some(GenerationConfig {
+                response_modalities: Some(vec![Modality::Audio]),
+                media_resolution: Some(MediaResolution::MediaResolutionHigh),
+                ..Default::default()
+            }),
+            input_audio_transcription: Some(AudioTranscriptionConfig {}),
+            output_audio_transcription: Some(AudioTranscriptionConfig {}),
+            tools: tools.build_live_tools(),
+            ..Default::default()
+        },
+        reconnect: ReconnectPolicy::default(),
+    })
+    .await
+}
+
+fn spawn_session_forwarder(
+    session: Session,
+    generation: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut recv = session;
+        while let Some(event) = recv.next_event().await {
+            if tx.send(AppEvent::Server { generation, event }).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_tool_call(
+    runtime: tooling::ToolRuntime,
+    session: Session,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    generation: u64,
+    call: FunctionCallRequest,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let call_id = call.id.clone();
+        let call_name = call.name.clone();
+        let response = runtime.execute_call(call).await;
+        let message = match session.send_tool_response(vec![response]).await {
+            Ok(()) => format!("[tool] responded: {call_name} ({call_id})"),
+            Err(e) => format!("[tool error] failed to send {call_name} ({call_id}): {e}"),
+        };
+        let _ = tx.send(AppEvent::ToolFinished {
+            generation,
+            call_id,
+            message,
+        });
+    })
+}
+
+fn cancel_pending_tools(pending: &mut HashMap<String, JoinHandle<()>>) {
+    for (_, handle) in pending.drain() {
+        handle.abort();
+    }
+}
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    session: Session,
-    model: &str,
+    startup: StartupConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(model);
+    let workspace_root = std::env::current_dir()?;
+    let mut app = App::new(&startup.connection_label(), tooling::ToolProfile::default());
+    let mut tool_runtime = tooling::ToolRuntime::new(workspace_root.clone(), app.active_tools)?;
 
-    // Session events → channel
-    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
-    let mut recv = session.clone();
-    tokio::spawn(async move {
-        while let Some(ev) = recv.next_event().await {
-            if srv_tx.send(ev).is_err() {
-                break;
-            }
-        }
-    });
+    app.sys(format!("tools active: {}", app.active_tools.summary()));
+    let mut session = connect_session(&startup, app.active_tools).await?;
+
+    // Session / tool events → channel
+    let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+    let mut generation = 0_u64;
+    let mut session_task = spawn_session_forwarder(session.clone(), generation, app_tx.clone());
+    let mut pending_tools: HashMap<String, JoinHandle<()>> = HashMap::new();
 
     // Shared AEC processor for echo cancellation between mic and speaker.
     #[cfg(any(feature = "mic", feature = "speak"))]
@@ -542,14 +611,93 @@ async fn run(
                         Some(Cmd::ToggleSpeaker) => toggle_speaker(&mut app, &mut speaker, &aec),
                         #[cfg(feature = "share-screen")]
                         Some(Cmd::ShareScreen(args)) => handle_share_screen(&mut app, &mut screen_share, &screen_tx, &args),
+                        Some(Cmd::ApplyTools) => {
+                            if app.active_tools == app.desired_tools {
+                                app.sys("tool profile already active".into());
+                            } else {
+                                match connect_session(&startup, app.desired_tools).await {
+                                    Ok(new_session) => {
+                                        generation += 1;
+                                        let new_generation = generation;
+                                        let new_task = spawn_session_forwarder(
+                                            new_session.clone(),
+                                            new_generation,
+                                            app_tx.clone(),
+                                        );
+                                        cancel_pending_tools(&mut pending_tools);
+                                        session_task.abort();
+                                        let old_session = std::mem::replace(&mut session, new_session);
+                                        session_task = new_task;
+                                        app.active_tools = app.desired_tools;
+                                        tool_runtime = tooling::ToolRuntime::new(
+                                            workspace_root.clone(),
+                                            app.active_tools,
+                                        )?;
+                                        old_session.close().await.ok();
+                                        app.sys(format!(
+                                            "reconnected with tools: {}",
+                                            app.active_tools.summary()
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        app.sys(format!("failed to apply staged tools: {e}"));
+                                    }
+                                }
+                            }
+                        }
                         None => {}
                     }
                 }
             }
-            Some(srv) = srv_rx.recv() => {
-                handle_server_event(&mut app, srv,
-                    #[cfg(feature = "speak")] &speaker,
-                );
+            Some(event) = app_rx.recv() => {
+                match event {
+                    AppEvent::Server { generation: event_generation, event } => {
+                        if event_generation != generation {
+                            continue;
+                        }
+                        match event {
+                            ServerEvent::ToolCall(calls) => {
+                                for call in calls {
+                                    app.sys(format!(
+                                        "[tool] requested {} ({})",
+                                        call.name, call.id
+                                    ));
+                                    let call_id = call.id.clone();
+                                    let handle = spawn_tool_call(
+                                        tool_runtime.clone(),
+                                        session.clone(),
+                                        app_tx.clone(),
+                                        generation,
+                                        call,
+                                    );
+                                    pending_tools.insert(call_id, handle);
+                                }
+                            }
+                            ServerEvent::ToolCallCancellation(ids) => {
+                                for id in ids {
+                                    if let Some(handle) = pending_tools.remove(&id) {
+                                        handle.abort();
+                                        app.sys(format!("[tool] cancelled {id}"));
+                                    }
+                                }
+                            }
+                            other => handle_server_event(&mut app, other,
+                                #[cfg(feature = "speak")] &speaker,
+                            ),
+                        }
+                    }
+                    AppEvent::ToolFinished {
+                        generation: event_generation,
+                        call_id,
+                        message,
+                    } => {
+                        if event_generation != generation {
+                            continue;
+                        }
+                        pending_tools.remove(&call_id);
+                        app.sys(message);
+                    }
+                }
             }
             Some(pcm) = mic_rx.recv() => {
                 #[cfg(feature = "mic")]
@@ -566,6 +714,8 @@ async fn run(
         }
     }
 
+    cancel_pending_tools(&mut pending_tools);
+    session_task.abort();
     session.close().await.ok();
     Ok(())
 }
@@ -579,6 +729,7 @@ enum Cmd {
     ToggleSpeaker,
     #[cfg(feature = "share-screen")]
     ShareScreen(String),
+    ApplyTools,
 }
 
 async fn handle_key(
@@ -602,6 +753,51 @@ async fn handle_key(
             #[cfg(feature = "share-screen")]
             if let Some(args) = trimmed.strip_prefix("/share-screen") {
                 return Ok(Some(Cmd::ShareScreen(args.trim().to_string())));
+            }
+            if let Some(command) = tooling::parse_tools_command(&trimmed) {
+                match command {
+                    Ok(tooling::ToolsCommand::Status) => {
+                        for line in tooling::status_lines(app.active_tools, app.desired_tools) {
+                            app.sys(line);
+                        }
+                    }
+                    Ok(tooling::ToolsCommand::List) => {
+                        for line in tooling::catalog_lines(app.active_tools, app.desired_tools) {
+                            app.sys(line);
+                        }
+                    }
+                    Ok(tooling::ToolsCommand::Enable(tool)) => {
+                        if app.desired_tools.set(tool, true) {
+                            app.sys(format!(
+                                "staged tool enable: {} (run `/tools apply` to reconnect)",
+                                tool.key()
+                            ));
+                        } else {
+                            app.sys(format!("tool already staged on: {}", tool.key()));
+                        }
+                    }
+                    Ok(tooling::ToolsCommand::Disable(tool)) => {
+                        if app.desired_tools.set(tool, false) {
+                            app.sys(format!(
+                                "staged tool disable: {} (run `/tools apply` to reconnect)",
+                                tool.key()
+                            ));
+                        } else {
+                            app.sys(format!("tool already staged off: {}", tool.key()));
+                        }
+                    }
+                    Ok(tooling::ToolsCommand::Toggle(tool)) => {
+                        let enabled = app.desired_tools.toggle(tool);
+                        let action = if enabled { "enable" } else { "disable" };
+                        app.sys(format!(
+                            "staged tool {action}: {} (run `/tools apply` to reconnect)",
+                            tool.key()
+                        ));
+                    }
+                    Ok(tooling::ToolsCommand::Apply) => return Ok(Some(Cmd::ApplyTools)),
+                    Err(err) => app.sys(format!("[tools] {err}")),
+                }
+                return Ok(None);
             }
             if !trimmed.is_empty() {
                 send_user_input(app, session, &trimmed).await?;

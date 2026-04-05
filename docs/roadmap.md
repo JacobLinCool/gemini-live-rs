@@ -30,7 +30,7 @@ Missing or incomplete functionality relative to the upstream API.
 | F-4 | Graceful shutdown propagation | `Session::close()` sends a close command but doesn't await the runner task to finish. Consider returning a `JoinHandle` or awaiting completion. | Low |
 | F-5 | `Stream` trait for `Session` | `events()` returns `impl Stream` via `unfold`, but `Session` itself doesn't implement `Stream`. Evaluate whether implementing `Stream<Item = ServerEvent>` directly on `Session` would be ergonomic. | Low |
 | F-6 | Audio output decoding | No counterpart to `AudioEncoder` for decoding received 24 kHz PCM audio (base64 decode + optional i16-to-f32 conversion). | Medium |
-| F-7 | Built-in Live tools | The official Live API now supports Google Search in addition to function calling. Add typed `googleSearch` / `google_search` setup coverage instead of forcing callers into raw JSON. | High |
+| F-7 | Broader built-in Live tools | Typed `googleSearch` setup coverage now exists. Extend the typed tool surface to the remaining built-in tools the Live API exposes on supported models/endpoints, instead of forcing callers into raw JSON. | Medium |
 | F-8 | Gemini 2.5-only session features | `enableAffectiveDialog` and `proactivity.proactiveAudio` are explicit Live API capabilities on Gemini 2.5 (`v1alpha`). Audit and add missing typed coverage. | Medium |
 | F-9 | Async function-calling wire semantics audit | Official docs put `behavior=NON_BLOCKING` on function declarations and `scheduling` inside `FunctionResponse.response`. Audit our types and examples against the current wire contract. | High |
 
@@ -42,7 +42,7 @@ end-user application.
 | ID | Item | Description | Priority |
 |----|------|-------------|----------|
 | C-1 | Session profiles | Including model / voice / system-prompt configuration. | High |
-| C-2 | Tool execution path | The library supports tool-call round trips, but the CLI ignores `ServerEvent::ToolCall`. Add a real tool execution and response flow. | High |
+| C-2 | Tool-profile resumption and context carryover | The CLI now executes local function calls and can enable Google Search, but `/tools apply` still uses a fresh session. Add an explicit resume / carryover path so tool-profile changes do not drop server-side conversation state. | High |
 | C-3 | Runtime observability | Surface reconnecting, closed, lagged, and send-failure states in the TUI instead of swallowing `.ok()` results. | High |
 | C-4 | Distribution truthfulness | `update.rs` advertises Linux ARM64, but the release workflow does not ship that artifact. Align updater targets with published binaries. | Medium |
 | C-5 | Extract testable CLI boundaries | Split command parsing, event reduction, and render-state transitions out of `main.rs` so the CLI can gain unit and snapshot coverage. | High |
@@ -59,7 +59,7 @@ Planned tests not yet implemented.
 | T-4 | Integration: GoAway reconnect | Session: simulate or trigger `GoAway` → verify auto-reconnect with resume handle. | Medium |
 | T-5 | E2E: multimodal streaming | Audio + video sent simultaneously; verify both are processed. | Low |
 | T-6 | Stress: reconnection stability | Unstable network simulation → verify no events are dropped across reconnections. | Low |
-| T-7 | CLI parser / reducer tests | There are no CLI tests today. Add unit tests for command parsing, server-event handling, and media input edge cases before the TUI surface grows further. | High |
+| T-7 | CLI parser / reducer / tool-runtime tests | Basic `/tools` parser and catalog tests now exist. Expand coverage to server-event handling, staged-profile apply flow, media input edge cases, and local tool execution boundaries. | High |
 
 ## Tech Debt
 

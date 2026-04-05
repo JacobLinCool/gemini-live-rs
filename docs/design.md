@@ -84,3 +84,22 @@ Multiple async tasks often need to hold the same session simultaneously (one sen
 `AudioEncoder` writes the PCM → base64 conversion into pre-allocated internal buffers and returns a borrowed `&str`. Callers reuse the same `AudioEncoder` instance in a loop, producing **no heap allocations** on the hot path.
 
 **Note:** the current `Session::send_audio` convenience method does **not** use `AudioEncoder` — it calls `STANDARD.encode()` which allocates a new `String` each time. Callers needing maximum performance should use `AudioEncoder` + `Session::send_raw` directly. This is a known gap (see [`roadmap.md`](roadmap.md) **P-1**).
+
+### ADR-6: CLI tool profile is staged, then applied via a fresh session
+
+Live API tools are part of the immutable `setup` payload for an open
+connection. The CLI therefore separates:
+
+- **desired tool profile** — changed by `/tools enable|disable|toggle`
+- **active tool profile** — the profile on the currently connected session
+
+`/tools apply` promotes the staged profile by opening a fresh session with the
+new `setup.tools` payload. This keeps the command surface honest: toggling a
+tool does not pretend to mutate a connection that the protocol says is already
+configured.
+
+The first implementation deliberately chooses a fresh session over automatic
+session-resumption surgery. The public API reference says configuration changes
+are possible during pause/resume, but the crate does not yet expose a precise,
+caller-controlled resume flow. Until that exists, the CLI prefers a simple,
+explicit reconnect over a half-specified hidden transition.

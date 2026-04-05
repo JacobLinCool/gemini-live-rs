@@ -215,6 +215,35 @@ mod tests {
     }
 
     #[test]
+    fn encode_setup_with_builtin_and_function_tools() {
+        let msg = ClientMessage::Setup(SetupConfig {
+            model: "models/gemini-3.1-flash-live-preview".into(),
+            tools: Some(vec![
+                Tool::GoogleSearch(GoogleSearchTool {}),
+                Tool::FunctionDeclarations(vec![FunctionDeclaration {
+                    name: "read_file".into(),
+                    description: "Read a file from the workspace.".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {
+                            "path": { "type": "string" }
+                        }
+                    }),
+                    scheduling: None,
+                    behavior: None,
+                }]),
+            ]),
+            ..Default::default()
+        });
+        let json = encode(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let tools = v["setup"]["tools"].as_array().expect("tools array");
+        assert_eq!(tools[0]["googleSearch"], serde_json::json!({}));
+        assert_eq!(tools[1]["functionDeclarations"][0]["name"], "read_file");
+    }
+
+    #[test]
     fn encode_client_content() {
         let msg = ClientMessage::ClientContent(ClientContent {
             turns: Some(vec![

@@ -258,14 +258,28 @@ pub struct HistoryConfig {
 
 /// Tool declarations made available during `setup`.
 ///
-/// This typed struct currently models custom function declarations only.
-/// Built-in Live API tools such as Google Search are tracked separately and
-/// currently require the crate's raw-message escape hatch.
+/// Each entry maps to exactly one top-level tool field on the wire, for
+/// example `{"googleSearch": {}}` or
+/// `{"functionDeclarations": [{...}, {...}]}`.
+///
+/// Keep built-in Live tools as first-class enum variants here instead of
+/// forcing callers through raw JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Tool {
-    pub function_declarations: Vec<FunctionDeclaration>,
+pub enum Tool {
+    /// Custom client-side functions that the model may call.
+    #[serde(rename = "functionDeclarations")]
+    FunctionDeclarations(Vec<FunctionDeclaration>),
+    /// Google-managed web search executed on the server side.
+    #[serde(rename = "googleSearch")]
+    GoogleSearch(GoogleSearchTool),
 }
+
+/// Enable the built-in Google Search tool.
+///
+/// This is a presence-activated empty object on the wire:
+/// `{"googleSearch": {}}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GoogleSearchTool {}
 
 /// A custom function the model may call during the session.
 ///

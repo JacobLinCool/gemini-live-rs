@@ -77,63 +77,17 @@ Client                                    Server
 
 ---
 
-## Message Format Quick Reference
+## Source of Truth
 
-**Client → Server** (4 kinds, each carrying exactly one top-level field):
+Message-kind semantics, VAD settings, turn coverage, transcription flags, and
+tool-field meanings should be read from the adjacent source comments in:
 
-| Wire field | Description | Code |
-|---|---|---|
-| `setup` | First message; configures model, tools, VAD, etc. | `types::client_message::SetupConfig` |
-| `clientContent` | Conversation history / incremental turns | `types::client_message::ClientContent` |
-| `realtimeInput` | Streaming audio / video / text / VAD signals | `types::client_message::RealtimeInput` |
-| `toolResponse` | Reply to a server-initiated function call | `types::client_message::ToolResponseMessage` |
+- `crates/gemini-live/src/types/client_message.rs`
+- `crates/gemini-live/src/types/config.rs`
+- `crates/gemini-live/src/types/server_message.rs`
 
-**Server → Client** (flat struct; multiple fields may be present simultaneously):
-
-| Wire field | Description | Code |
-|---|---|---|
-| `setupComplete` | Confirms setup was accepted | `ServerEvent::SetupComplete` |
-| `serverContent` | Model response / transcription / interruption | `ServerEvent::ModelText` / `ModelAudio` / … |
-| `toolCall` | Requests function execution | `ServerEvent::ToolCall` |
-| `toolCallCancellation` | Cancels a previous call | `ServerEvent::ToolCallCancellation` |
-| `goAway` | Server will disconnect soon; client should reconnect | `ServerEvent::GoAway` |
-| `sessionResumptionUpdate` | Fresh resume handle | `ServerEvent::SessionResumption` |
-| `usageMetadata` | Token usage stats | `ServerEvent::Usage` |
-| `error` | Error | `ServerEvent::Error` |
-
-> Full field definitions are in the `types/` module doc comments.
-
----
-
-## VAD & Turn Management
-
-### Automatic VAD (default)
-
-| Parameter | Description | Default |
-|---|---|---|
-| `startOfSpeechSensitivity` | Speech onset detection sensitivity | HIGH |
-| `endOfSpeechSensitivity` | Speech offset detection sensitivity | HIGH |
-| `prefixPaddingMs` | Audio retained before detected speech onset | 0 |
-| `silenceDurationMs` | Silence duration to mark speech as ended | server default |
-
-### Manual VAD
-
-Set `automaticActivityDetection.disabled = true`; the client sends `activityStart` / `activityEnd`.
-
-### Activity Handling
-
-| Value | Behaviour |
-|---|---|
-| `START_OF_ACTIVITY_INTERRUPTS` | User speech interrupts the model (default) |
-| `NO_INTERRUPTION` | Model continues uninterrupted |
-
-### Turn Coverage
-
-| Value | Default for |
-|---|---|
-| `TURN_INCLUDES_ONLY_ACTIVITY` | Gemini 2.5 |
-| `TURN_INCLUDES_ALL_INPUT` | — |
-| `TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO` | Gemini 3.1 |
+This file intentionally keeps only the cross-cutting facts that do not have a
+better natural home in one specific Rust type.
 
 ---
 
@@ -141,9 +95,10 @@ Set `automaticActivityDetection.disabled = true`; the client sends `activityStar
 
 ### Session Resumption
 
-- Include `sessionResumption: {}` in setup to opt in
-- The server continuously sends fresh handles via `sessionResumptionUpdate`
-- Resumption tokens are valid for **2 hours after the last session termination**
+- Include `sessionResumption: {}` in setup to opt in.
+- The server continuously sends fresh handles via `sessionResumptionUpdate`.
+- Canonical field semantics live on `SessionResumptionConfig` and in
+  `session.rs`.
 
 ### Context Window Compression
 

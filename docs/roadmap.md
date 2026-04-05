@@ -16,7 +16,7 @@ Items from the "maximum performance" goal (see `design.md`).
 | P-2 | `codec::encode` per-call allocation | `serde_json::to_string` allocates a new `String` per call. Should offer `encode_into(&mut Vec<u8>)` writing into a reusable buffer. | Medium |
 | P-3 | `codec::into_events` audio decode allocation | base64 decoding audio data allocates a new `Vec<u8>`. Consider decode-in-place or caller-provided buffer. | Low |
 | P-4 | `ServerEvent::ModelAudio` clone cost | Holds `Vec<u8>`; broadcast channel clones the entire buffer on send. Switch to `bytes::Bytes` (ref-counted, O(1) clone). | Medium |
-| P-5 | Benchmarks | No benchmarks exist yet. Add `criterion` benchmarks for the hot path: audio encode, codec encode/decode, base64 round-trip. Needed to validate all other perf work. | High |
+| P-5 | Benchmark baselines and CI gating | Criterion benchmarks now exist in `crates/gemini-live/benches/hot_path.rs`, but there are no checked-in baselines, regression thresholds, or CI reporting. We still cannot prove whether perf changes help or hurt over time. | Medium |
 
 ## Features
 
@@ -30,6 +30,22 @@ Missing or incomplete functionality relative to the upstream API.
 | F-4 | Graceful shutdown propagation | `Session::close()` sends a close command but doesn't await the runner task to finish. Consider returning a `JoinHandle` or awaiting completion. | Low |
 | F-5 | `Stream` trait for `Session` | `events()` returns `impl Stream` via `unfold`, but `Session` itself doesn't implement `Stream`. Evaluate whether implementing `Stream<Item = ServerEvent>` directly on `Session` would be ergonomic. | Low |
 | F-6 | Audio output decoding | No counterpart to `AudioEncoder` for decoding received 24 kHz PCM audio (base64 decode + optional i16-to-f32 conversion). | Medium |
+| F-7 | Built-in Live tools | The official Live API now supports Google Search in addition to function calling. Add typed `googleSearch` / `google_search` setup coverage instead of forcing callers into raw JSON. | High |
+| F-8 | Gemini 2.5-only session features | `enableAffectiveDialog` and `proactivity.proactiveAudio` are explicit Live API capabilities on Gemini 2.5 (`v1alpha`). Audit and add missing typed coverage. | Medium |
+| F-9 | Async function-calling wire semantics audit | Official docs put `behavior=NON_BLOCKING` on function declarations and `scheduling` inside `FunctionResponse.response`. Audit our types and examples against the current wire contract. | High |
+
+## CLI Product
+
+Work needed to turn `gemini-live-cli` from a good demo into a dependable
+end-user application.
+
+| ID | Item | Description | Priority |
+|----|------|-------------|----------|
+| C-1 | Session profiles | Including model / voice / system-prompt configuration. | High |
+| C-2 | Tool execution path | The library supports tool-call round trips, but the CLI ignores `ServerEvent::ToolCall`. Add a real tool execution and response flow. | High |
+| C-3 | Runtime observability | Surface reconnecting, closed, lagged, and send-failure states in the TUI instead of swallowing `.ok()` results. | High |
+| C-4 | Distribution truthfulness | `update.rs` advertises Linux ARM64, but the release workflow does not ship that artifact. Align updater targets with published binaries. | Medium |
+| C-5 | Extract testable CLI boundaries | Split command parsing, event reduction, and render-state transitions out of `main.rs` so the CLI can gain unit and snapshot coverage. | High |
 
 ## Testing
 
@@ -43,6 +59,7 @@ Planned tests not yet implemented.
 | T-4 | Integration: GoAway reconnect | Session: simulate or trigger `GoAway` → verify auto-reconnect with resume handle. | Medium |
 | T-5 | E2E: multimodal streaming | Audio + video sent simultaneously; verify both are processed. | Low |
 | T-6 | Stress: reconnection stability | Unstable network simulation → verify no events are dropped across reconnections. | Low |
+| T-7 | CLI parser / reducer tests | There are no CLI tests today. Add unit tests for command parsing, server-event handling, and media input edge cases before the TUI surface grows further. | High |
 
 ## Tech Debt
 
@@ -51,5 +68,4 @@ Code quality issues that aren't bugs but should be cleaned up.
 | ID | Item | Description | Severity |
 |----|------|-------------|----------|
 | D-2 | Error granularity on connect | `ConnectError::Dns` and `ConnectError::Tls` variants exist but are never constructed — all non-HTTP errors fall into `ConnectError::Ws`. Add classification logic or remove dead variants. | Low |
-| D-3 | `reqwest` workspace dependency unused | `reqwest` is declared in workspace `Cargo.toml` but not used by any crate. Either implement F-1 (ephemeral token helper) or remove it. | Low |
-
+| D-3 | Library/CLI distribution mismatch | The CLI's self-update path, release workflow, and install script need to be kept in sync. Today the updater advertises at least one target that the release workflow does not build. | Medium |

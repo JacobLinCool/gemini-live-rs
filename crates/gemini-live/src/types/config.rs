@@ -3,6 +3,9 @@
 //! These control model behaviour, audio/video input handling, VAD, session
 //! resumption, context compression, and more.  All structs derive [`Default`]
 //! so callers can use the `..Default::default()` pattern for partial init.
+//!
+//! When upstream model families differ, prefer documenting the difference on
+//! the exact field or type that carries it.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +16,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct GenerationConfig {
     /// Which modalities the model should produce (`AUDIO`, `TEXT`, or both).
+    ///
+    /// For voice-first clients this is typically `[AUDIO]` or
+    /// `[AUDIO, TEXT]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_modalities: Option<Vec<Modality>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,8 +186,8 @@ pub enum TurnCoverage {
 /// Enables session resumption.  Include an empty struct to opt in; pass a
 /// previous `handle` to resume a disconnected session.
 ///
-/// Handles are valid for **2 hours** after disconnect; sessions can be
-/// resumed within **24 hours**.
+/// The Live API currently documents resumption tokens as valid for **2 hours
+/// after the last session termination**.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionResumptionConfig {
@@ -215,11 +221,18 @@ pub struct SlidingWindow {
 
 /// Presence-activated config — include an empty `{}` to enable transcription
 /// for the corresponding direction (input or output).
+///
+/// The server treats the field's presence as the signal; callers should send
+/// `Some(AudioTranscriptionConfig {})`, not a boolean.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AudioTranscriptionConfig {}
 
 // ── Proactivity (v1alpha, Gemini 2.5) ────────────────────────────────────────
 
+/// Gemini 2.5-only proactive audio settings (`v1alpha`).
+///
+/// New model families may ignore this entirely, so callers should treat it as
+/// model-specific rather than universally available.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProactivityConfig {
@@ -243,12 +256,21 @@ pub struct HistoryConfig {
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
+/// Tool declarations made available during `setup`.
+///
+/// This typed struct currently models custom function declarations only.
+/// Built-in Live API tools such as Google Search are tracked separately and
+/// currently require the crate's raw-message escape hatch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
     pub function_declarations: Vec<FunctionDeclaration>,
 }
 
+/// A custom function the model may call during the session.
+///
+/// Keep this aligned with the official Live API tool docs. Gemini 3.1 and 2.5
+/// differ in important ways, especially around asynchronous tool execution.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionDeclaration {
@@ -256,7 +278,12 @@ pub struct FunctionDeclaration {
     pub description: String,
     /// JSON Schema object describing the function's parameters.
     pub parameters: serde_json::Value,
-    /// Gemini 2.5: when to trigger this function relative to model output.
+    /// Crate-level scheduling field retained for Gemini 2.5 compatibility
+    /// work.
+    ///
+    /// Official current Live API docs place response scheduling inside the
+    /// tool-response payload, not here. Treat this field as under audit until
+    /// roadmap item `F-9` is completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduling: Option<FunctionScheduling>,
     /// Gemini 2.5: whether the function blocks model generation.
@@ -264,7 +291,9 @@ pub struct FunctionDeclaration {
     pub behavior: Option<FunctionBehavior>,
 }
 
-/// When the function call is dispatched relative to model output.
+/// Scheduling values historically associated with Gemini 2.5 tool execution.
+///
+/// See [`FunctionDeclaration::scheduling`] for the current crate caveat.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FunctionScheduling {

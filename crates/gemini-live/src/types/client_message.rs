@@ -39,33 +39,49 @@ pub enum ClientMessage {
 
 /// The first (and only) `setup` message, configuring the session.
 ///
-/// `model` is the only required field.  All others have sensible server
+/// `model` is the only required field. All others have sensible server
 /// defaults when omitted.
+///
+/// This is the canonical home for setup-field semantics in the crate. Keep
+/// model-family caveats and wire-format notes on these fields rather than
+/// restating them in standalone docs.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupConfig {
     /// Model resource name, e.g. `"models/gemini-3.1-flash-live-preview"`.
     pub model: String,
+    /// Generation-time settings such as response modalities, voice, thinking,
+    /// and sampling controls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
+    /// System prompt or instruction content applied at session setup time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<Content>,
+    /// Tool definitions available to the model for this session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// Real-time audio/video interpretation settings including VAD behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_input_config: Option<RealtimeInputConfig>,
+    /// Opts the session into server-issued resume handles.
+    ///
+    /// The session layer patches `handle` automatically during reconnects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_resumption: Option<SessionResumptionConfig>,
+    /// Server-managed context compression settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window_compression: Option<ContextWindowCompressionConfig>,
+    /// Presence-activated input speech transcription (`{}` to enable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_audio_transcription: Option<AudioTranscriptionConfig>,
+    /// Presence-activated output speech transcription (`{}` to enable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_audio_transcription: Option<AudioTranscriptionConfig>,
     /// Proactive audio (v1alpha, Gemini 2.5 only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proactivity: Option<ProactivityConfig>,
-    /// History bootstrapping (Gemini 3.1).
+    /// History bootstrapping (Gemini 3.1). This only affects how initial
+    /// `clientContent` may be sent before the first `realtimeInput`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_config: Option<HistoryConfig>,
 }
@@ -136,5 +152,9 @@ pub struct FunctionResponse {
     pub id: String,
     pub name: String,
     /// Arbitrary JSON result returned to the model.
+    ///
+    /// Keep the payload flexible: current Live API docs place some Gemini 2.5
+    /// tool-response scheduling knobs inside this JSON object rather than as a
+    /// top-level Rust field.
     pub response: serde_json::Value,
 }

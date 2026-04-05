@@ -2,6 +2,8 @@
 //!
 //! [`Session`] manages the full connection lifecycle: WebSocket connect,
 //! `setup` handshake, automatic reconnection, and typed send/receive.
+//! Because Live API WebSocket sessions are finite-lived, this layer also owns
+//! `goAway` handling and session-resumption handoff.
 //!
 //! # Architecture
 //!
@@ -48,6 +50,10 @@ const COMMAND_CHANNEL_CAPACITY: usize = 64;
 
 /// Complete session configuration combining transport, protocol, and
 /// reconnection settings.
+///
+/// `setup` is sent on the initial connect and again on every reconnect. When a
+/// fresh resume handle exists, the session layer injects it into
+/// `setup.session_resumption.handle` before sending.
 pub struct SessionConfig {
     pub transport: TransportConfig,
     pub setup: SetupConfig,
@@ -57,6 +63,9 @@ pub struct SessionConfig {
 /// Reconnection behaviour after an unexpected disconnect or `goAway`.
 ///
 /// Backoff formula: `base_backoff × 2^(attempt − 1)`, capped at `max_backoff`.
+///
+/// Outbound messages continue to queue in the command channel while reconnect
+/// attempts are in progress.
 pub struct ReconnectPolicy {
     /// Enable automatic reconnection.  Default: `true`.
     pub enabled: bool,
@@ -317,6 +326,9 @@ impl Session {
     ///
     /// Sends a WebSocket close frame and shuts down the background runner.
     /// Other clones of this session will observe `SessionStatus::Closed`.
+    ///
+    /// This only enqueues the close request; it does not await runner-task
+    /// completion yet.
     pub async fn close(self) -> Result<(), SessionError> {
         let _ = self.cmd_tx.send(Command::Close).await;
         Ok(())

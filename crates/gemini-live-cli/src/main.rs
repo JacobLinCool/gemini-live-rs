@@ -9,6 +9,18 @@
 //! - `/speak`        — toggle audio playback of model responses
 //! - `/share-screen` — share a monitor or window as video
 //! - `@file`         — send an image or audio file inline
+//!
+//! # Current Default Profile
+//!
+//! The CLI currently boots into a single opinionated voice-first profile:
+//!
+//! - `responseModalities = ["AUDIO"]`
+//! - `inputAudioTranscription = {}`
+//! - `outputAudioTranscription = {}`
+//! - no first-class Live API tool execution yet
+//!
+//! This module doc is the canonical home for the default CLI session profile.
+//! Keep it in sync with the `SetupConfig` built in `main()`.
 
 #[cfg(any(feature = "mic", feature = "speak"))]
 mod audio_io;
@@ -67,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth: Auth::ApiKey(api_key),
             ..Default::default()
         },
+        // The CLI's current built-in profile is intentionally voice-first.
         setup: SetupConfig {
             model: model.clone(),
             generation_config: Some(GenerationConfig {

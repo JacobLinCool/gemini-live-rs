@@ -15,19 +15,11 @@ Override the model:
 GEMINI_MODEL=models/gemini-2.5-flash-native-audio-latest cargo run -p gemini-live-cli
 ```
 
-## Current Session Profile
+## Canonical Behavior
 
-The current CLI is intentionally opinionated:
-
-- It connects with `responseModalities = ["AUDIO"]`
-- It enables `inputAudioTranscription`
-- It enables `outputAudioTranscription`
-- It does **not** execute Live API tool calls yet
-
-That means the default experience is "model speaks, CLI shows the output
-transcript" while also rendering user speech transcriptions when the API sends
-them. Any future text-first, hybrid, or tool-enabled modes should be documented
-here as explicit profiles rather than being implied by examples.
+The canonical description of the default CLI session profile now lives in the
+module docs for `crates/gemini-live-cli/src/main.rs`. Keep that source comment
+in sync with the `SetupConfig` built by the CLI entrypoint.
 
 ## UI Layout
 
@@ -120,6 +112,6 @@ stream audio/video simultaneously without any of these blocking each other.
 
 ## Current Limitations
 
-- No first-class tool execution path yet; `ToolCall` messages are ignored
-- No explicit text / hybrid / voice profile selection beyond environment variables
-- The self-update command only works for targets that are actually published in GitHub Releases
+See `crates/gemini-live-cli/src/main.rs` for code-adjacent notes about the
+default profile and current tool-execution gap. This file is intentionally kept
+as an entry guide rather than the canonical home of runtime behavior.

@@ -1,5 +1,8 @@
+mod media;
+
 use std::io::Write;
 
+use base64::Engine;
 use gemini_live::session::{ReconnectPolicy, Session, SessionConfig};
 use gemini_live::transport::{Auth, TransportConfig};
 use gemini_live::types::*;
@@ -29,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             generation_config: Some(GenerationConfig {
                 response_modalities: Some(vec![Modality::Audio]),
+                media_resolution: Some(MediaResolution::MediaResolutionLow),
                 ..Default::default()
             }),
             output_audio_transcription: Some(AudioTranscriptionConfig {}),
@@ -38,7 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    eprintln!("connected — type a message and press Enter (Ctrl-D to quit)\n");
+    eprintln!("connected — type a message and press Enter (Ctrl-D to quit)");
+    eprintln!("  use @file.jpg / @file.wav to send images or audio\n");
 
     // Event printer task
     let mut recv = session.clone();
@@ -76,7 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stderr().flush().ok();
             continue;
         }
-        if let Err(e) = session.send_text(trimmed).await {
+
+        if let Err(e) = send_input(&session, trimmed).await {
             eprintln!("[send error] {e}");
             break;
         }
@@ -85,4 +91,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.close().await?;
     let _ = printer.await;
     Ok(())
+}
+
+async fn send_input(session: &Session, line: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let (text, file_paths) = media::parse_input(line);
+
+    // Send media files first
+    for path in &file_paths {
+        match media::load(path) {
+            Ok(m) => {
+                eprintln!("  {}", media::describe(path, &m));
+                match m {
+                    media::Media::Image { data, mime } => {
+                        session.send_video(&data, mime).await?;
+                    }
+                    media::Media::Audio { pcm, sample_rate } => {
+                        send_audio_with_rate(session, &pcm, sample_rate).await?;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  [skip] @{path}: {e}");
+            }
+        }
+    }
+
+    // If we sent media, give the model a moment to process it before sending text.
+    if !file_paths.is_empty() && !text.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Send text if any
+    if !text.is_empty() {
+        session.send_text(&text).await?;
+    }
+
+    Ok(())
+}
+
+async fn send_audio_with_rate(
+    session: &Session,
+    pcm: &[u8],
+    sample_rate: u32,
+) -> Result<(), gemini_live::SessionError> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(pcm);
+    let mime = format!("audio/pcm;rate={sample_rate}");
+    session
+        .send_raw(ClientMessage::RealtimeInput(RealtimeInput {
+            audio: Some(Blob {
+                data: b64,
+                mime_type: mime,
+            }),
+            video: None,
+            text: None,
+            activity_start: None,
+            activity_end: None,
+            audio_stream_end: None,
+        }))
+        .await
 }

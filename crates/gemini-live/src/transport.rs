@@ -54,7 +54,7 @@ pub struct TransportConfig {
     pub auth: Auth,
     /// Override the default endpoint (for testing or Vertex AI).
     pub endpoint_override: Option<String>,
-    /// WebSocket write buffer size in bytes.  Default: 64 KB.
+    /// WebSocket write buffer size in bytes.  Default: 1 MB.
     pub write_buffer_size: usize,
     /// Maximum WebSocket frame size in bytes.  Default: 16 MB.
     pub max_frame_size: usize,
@@ -67,7 +67,7 @@ impl Default for TransportConfig {
         Self {
             auth: Auth::ApiKey(String::new()),
             endpoint_override: None,
-            write_buffer_size: 64 * 1024,
+            write_buffer_size: 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             connect_timeout: Duration::from_secs(10),
         }
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = TransportConfig::default();
-        assert_eq!(config.write_buffer_size, 64 * 1024);
+        assert_eq!(config.write_buffer_size, 1024 * 1024);
         assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert!(config.endpoint_override.is_none());

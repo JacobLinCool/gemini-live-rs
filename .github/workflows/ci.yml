@@ -40,7 +40,9 @@ jobs:
             libpipewire-0.3-dev \
             libspa-0.2-dev \
             libclang-dev \
-            cmake
+            cmake \
+            meson \
+            ninja-build
 
       - name: Format check
         run: cargo fmt --all -- --check

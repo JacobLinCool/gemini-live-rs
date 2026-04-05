@@ -112,6 +112,7 @@ struct Msg {
 #[derive(Clone, Copy)]
 enum Role {
     User,
+    Transcription,
     Model,
     System,
 }
@@ -319,6 +320,12 @@ async fn send_user_input(
 
 fn handle_server_event(app: &mut App, event: ServerEvent, speaker: &Option<audio_io::Speaker>) {
     match event {
+        ServerEvent::InputTranscription(text) => {
+            app.messages.push(Msg {
+                role: Role::Transcription,
+                text,
+            });
+        }
         ServerEvent::OutputTranscription(text) => app.pending.push_str(&text),
         ServerEvent::ModelText(text) => app.pending.push_str(&text),
         ServerEvent::TurnComplete => {
@@ -363,6 +370,11 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 Style::default(),
+            ),
+            Role::Transcription => (
+                "[you] (transcription) ",
+                Style::default().fg(Color::Cyan),
+                Style::default().fg(Color::DarkGray),
             ),
             Role::Model => (
                 "[model] ",

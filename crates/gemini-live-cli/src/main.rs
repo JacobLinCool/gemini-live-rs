@@ -15,6 +15,7 @@ mod audio_io;
 mod media;
 #[cfg(feature = "share-screen")]
 mod screen;
+mod update;
 
 use std::io;
 
@@ -35,6 +36,20 @@ use gemini_live::types::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::args().nth(1).as_deref() {
+        Some("update") => return update::run().await,
+        Some("--version" | "-V") => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(arg) => {
+            eprintln!("unknown command: {arg}");
+            eprintln!("usage: {} [update | --version]", env!("CARGO_PKG_NAME"));
+            std::process::exit(1);
+        }
+        None => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),

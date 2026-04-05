@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: contains(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-randr0-dev \
+            libxcb-shm0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-composite0-dev \
+            libxcb-shape0-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libclang-dev \
+            cmake \
+            meson \
+            ninja-build
+
+      - name: Install system dependencies (macOS)
+        if: contains(matrix.os, 'macos')
+        run: brew install meson ninja
+
+      - name: Build
+        run: cargo build --release -p gemini-live-cli
+
+      - name: Package
+        run: |
+          cd target/release
+          tar czf ../../gemini-live-cli-${{ matrix.target }}.tar.gz gemini-live-cli
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gemini-live-cli-${{ matrix.target }}
+          path: gemini-live-cli-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: gemini-live-cli-*.tar.gz

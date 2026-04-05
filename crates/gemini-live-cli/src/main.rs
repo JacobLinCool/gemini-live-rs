@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model: model.clone(),
             generation_config: Some(GenerationConfig {
                 response_modalities: Some(vec![Modality::Audio]),
-                media_resolution: Some(MediaResolution::MediaResolutionLow),
+                media_resolution: Some(MediaResolution::MediaResolutionHigh),
                 ..Default::default()
             }),
             output_audio_transcription: Some(AudioTranscriptionConfig {}),

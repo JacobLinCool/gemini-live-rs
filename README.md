@@ -17,6 +17,10 @@ High-performance Rust client for the [Gemini Multimodal Live API](https://ai.goo
 - **Clone-friendly sessions** — `Session` is cheaply cloneable; multiple tasks can send and receive concurrently
 - **Vertex-ready transport** — first-class Vertex AI Live routing via regional endpoints and bearer-token auth
 
+## Demo
+
+<video width="630" height="300" src="https://raw.githubusercontent.com/jacoblincool/gemini-live-rs/main/gemini-live-demo.mp4"></video>
+
 ## Quick Start
 
 Add to your `Cargo.toml`:

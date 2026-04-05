@@ -8,8 +8,8 @@ repository.workspace = true
 
 [features]
 default = ["mic", "speak", "share-screen"]
-mic = ["dep:cpal"]
-speak = ["dep:cpal"]
+mic = ["dep:cpal", "dep:webrtc-audio-processing"]
+speak = ["dep:cpal", "dep:webrtc-audio-processing"]
 share-screen = ["dep:xcap", "dep:image"]
 
 [dependencies]
@@ -23,5 +23,6 @@ hound = "3.5"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 cpal = { version = "0.15", optional = true }
+webrtc-audio-processing = { version = "2.0", features = ["bundled"], optional = true }
 xcap = { version = "0.9", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }

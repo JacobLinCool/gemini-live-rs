@@ -96,6 +96,10 @@ fn install_panic_hook() {
     }));
 }
 
+/// AEC processes at 48 kHz — mic output is always at this rate.
+#[cfg(feature = "mic")]
+const AEC_SEND_RATE: u32 = 48_000;
+
 // ── App state ────────────────────────────────────────────────────────────────
 
 struct App {
@@ -173,6 +177,10 @@ async fn run(
         }
     });
 
+    // Shared AEC processor for echo cancellation between mic and speaker.
+    #[cfg(any(feature = "mic", feature = "speak"))]
+    let aec = audio_io::create_aec();
+
     // Audio I/O state (channels always exist; data only flows when active)
     let (_mic_tx, mut mic_rx) = mpsc::channel::<Vec<u8>>(32);
     #[cfg(feature = "mic")]
@@ -204,9 +212,9 @@ async fn run(
                 {
                     match handle_key(&mut app, key.code, key.modifiers, &session).await? {
                         #[cfg(feature = "mic")]
-                        Some(Cmd::ToggleMic) => toggle_mic(&mut app, &mut mic, &mic_tx, &session).await,
+                        Some(Cmd::ToggleMic) => toggle_mic(&mut app, &mut mic, &mic_tx, &aec, &session).await,
                         #[cfg(feature = "speak")]
-                        Some(Cmd::ToggleSpeaker) => toggle_speaker(&mut app, &mut speaker),
+                        Some(Cmd::ToggleSpeaker) => toggle_speaker(&mut app, &mut speaker, &aec),
                         #[cfg(feature = "share-screen")]
                         Some(Cmd::ShareScreen(args)) => handle_share_screen(&mut app, &mut screen_share, &screen_tx, &args),
                         None => {}
@@ -221,8 +229,8 @@ async fn run(
             Some(pcm) = mic_rx.recv() => {
                 #[cfg(feature = "mic")]
                 {
-                    let rate = mic.as_ref().map(|m| m.sample_rate).unwrap_or(16_000);
-                    session.send_audio_at_rate(&pcm, rate).await.ok();
+                    // Audio has already been echo-cancelled by the AEC in audio_io.
+                    session.send_audio_at_rate(&pcm, AEC_SEND_RATE).await.ok();
                 }
                 #[cfg(not(feature = "mic"))]
                 drop(pcm);
@@ -290,6 +298,7 @@ async fn toggle_mic(
     app: &mut App,
     mic: &mut Option<audio_io::Mic>,
     tx: &mpsc::Sender<Vec<u8>>,
+    aec: &std::sync::Arc<webrtc_audio_processing::Processor>,
     session: &Session,
 ) {
     if mic.is_some() {
@@ -298,9 +307,12 @@ async fn toggle_mic(
         app.sys("mic off".into());
         session.audio_stream_end().await.ok();
     } else {
-        match audio_io::Mic::start(tx.clone()) {
+        match audio_io::Mic::start(tx.clone(), aec.clone()) {
             Ok(m) => {
-                app.sys(format!("mic on ({}Hz)", m.sample_rate));
+                app.sys(format!(
+                    "mic on ({}Hz → AEC {}Hz)",
+                    m.sample_rate, AEC_SEND_RATE
+                ));
                 app.mic_on = true;
                 *mic = Some(m);
             }
@@ -310,15 +322,19 @@ async fn toggle_mic(
 }
 
 #[cfg(feature = "speak")]
-fn toggle_speaker(app: &mut App, speaker: &mut Option<audio_io::Speaker>) {
+fn toggle_speaker(
+    app: &mut App,
+    speaker: &mut Option<audio_io::Speaker>,
+    aec: &std::sync::Arc<webrtc_audio_processing::Processor>,
+) {
     if speaker.is_some() {
         *speaker = None;
         app.speak_on = false;
         app.sys("speaker off".into());
     } else {
-        match audio_io::Speaker::start() {
+        match audio_io::Speaker::start(aec.clone()) {
             Ok(s) => {
-                app.sys(format!("speaker on ({}Hz)", s.device_rate));
+                app.sys(format!("speaker on ({}Hz, AEC enabled)", s.device_rate));
                 app.speak_on = true;
                 *speaker = Some(s);
             }

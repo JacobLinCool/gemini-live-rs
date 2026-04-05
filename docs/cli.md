@@ -54,7 +54,7 @@ Supported audio formats: WAV (any sample rate, auto mono mixdown), raw PCM (.pcm
 | Command | Action |
 |---------|--------|
 | `/mic` | Toggle microphone input. Captures from the default input device and streams to the API at the device's native sample rate. |
-| `/speak` | Toggle speaker output. Plays model audio (24 kHz PCM) through the default output device, resampled to the device's native rate. |
+| `/speak` | Toggle speaker output. Plays model audio (24 kHz PCM) through the default output device, resampled to the device's native rate. When both mic and speak are on, WebRTC AEC (Acoustic Echo Cancellation) automatically removes speaker echo from the mic signal. |
 | `/share-screen list` | List available capture targets (monitors and windows) with IDs. |
 | `/share-screen <id> [interval]` | Start sharing a monitor or window. `interval` is seconds between frames (default: 1). Example: `/share-screen 0 5` shares Display 1 every 5 seconds. |
 | `/share-screen` | Stop screen sharing (when active). |
@@ -73,8 +73,8 @@ Each slash command group is a separate Cargo feature, all enabled by default:
 
 | Feature | Dependencies | Enables |
 |---------|-------------|---------|
-| `mic` | `cpal` | `/mic` command |
-| `speak` | `cpal` | `/speak` command |
+| `mic` | `cpal`, `webrtc-audio-processing` | `/mic` command with AEC |
+| `speak` | `cpal`, `webrtc-audio-processing` | `/speak` command with AEC |
 | `share-screen` | `xcap`, `image` | `/share-screen` command |
 
 Build without audio/screen support for a minimal binary:

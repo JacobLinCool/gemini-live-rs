@@ -19,7 +19,7 @@ High-performance Rust client for the [Gemini Multimodal Live API](https://ai.goo
 
 ## Demo
 
-<video width="630" height="300" src="https://raw.githubusercontent.com/jacoblincool/gemini-live-rs/main/gemini-live-demo.mp4"></video>
+https://github.com/user-attachments/assets/745ef771-bae7-41ef-bd4f-baa994723a75
 
 ## Quick Start
 

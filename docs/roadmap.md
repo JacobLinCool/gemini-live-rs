@@ -30,6 +30,7 @@ Missing or incomplete functionality relative to the upstream API.
 | F-4 | Graceful shutdown propagation | `Session::close()` sends a close command but doesn't await the runner task to finish. Consider returning a `JoinHandle` or awaiting completion. | Low |
 | F-5 | `Stream` trait for `Session` | `events()` returns `impl Stream` via `unfold`, but `Session` itself doesn't implement `Stream`. Evaluate whether implementing `Stream<Item = ServerEvent>` directly on `Session` would be ergonomic. | Low |
 | F-6 | Audio output decoding | No counterpart to `AudioEncoder` for decoding received 24 kHz PCM audio (base64 decode + optional i16-to-f32 conversion). | Medium |
+| F-7 | `send_audio` with custom sample rate | `Session::send_audio` hardcodes `audio/pcm;rate=16000`. Add `send_audio_at_rate(pcm, rate)` so callers with non-16kHz sources (mic, WAV files) don't need `send_raw`. CLI currently works around this. | Medium |
 
 ## Testing
 

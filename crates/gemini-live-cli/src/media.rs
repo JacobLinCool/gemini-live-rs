@@ -1,3 +1,8 @@
+//! File loading for `@file` references — images and audio.
+//!
+//! Supports JPEG, PNG, GIF, WebP, BMP images and WAV / raw PCM audio.
+//! WAV files are decoded to mono i16-LE PCM at the file's native sample rate.
+
 use std::path::Path;
 
 /// A loaded media file ready to send.

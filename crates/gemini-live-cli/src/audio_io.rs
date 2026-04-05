@@ -1,3 +1,9 @@
+//! Audio I/O via `cpal` — microphone capture and speaker playback.
+//!
+//! [`Mic`] opens the default input device and sends mono i16-LE PCM chunks
+//! through a tokio channel.  [`Speaker`] opens the default output device and
+//! plays model audio (24 kHz) resampled to the device's native rate.
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 

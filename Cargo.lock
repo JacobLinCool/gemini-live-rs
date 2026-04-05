@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "gemini-live"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "criterion",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "gemini-live-cli"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "cpal",
  "crossterm",

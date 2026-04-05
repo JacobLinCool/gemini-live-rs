@@ -48,3 +48,8 @@ jobs:
         run: cargo publish -p gemini-live
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish gemini-live-cli
+        run: cargo publish -p gemini-live-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

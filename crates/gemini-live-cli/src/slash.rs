@@ -187,6 +187,30 @@ enum CliToolArg {
         alias = "run_terminal"
     )]
     RunCommand,
+    #[cfg(feature = "mic")]
+    #[value(
+        name = "desktop-microphone",
+        alias = "desktop_microphone",
+        alias = "microphone",
+        alias = "mic-tool"
+    )]
+    DesktopMicrophone,
+    #[cfg(feature = "speak")]
+    #[value(
+        name = "desktop-speaker",
+        alias = "desktop_speaker",
+        alias = "speaker",
+        alias = "speaker-tool"
+    )]
+    DesktopSpeaker,
+    #[cfg(feature = "share-screen")]
+    #[value(
+        name = "desktop-screen-share",
+        alias = "desktop_screen_share",
+        alias = "screen-share-tool",
+        alias = "screen-tool"
+    )]
+    DesktopScreenShare,
 }
 
 impl From<CliSlashCommand> for SlashCommand {
@@ -234,6 +258,12 @@ impl From<CliToolArg> for ToolId {
             CliToolArg::ListFiles => Self::ListFiles,
             CliToolArg::ReadFile => Self::ReadFile,
             CliToolArg::RunCommand => Self::RunCommand,
+            #[cfg(feature = "mic")]
+            CliToolArg::DesktopMicrophone => Self::DesktopMicrophone,
+            #[cfg(feature = "speak")]
+            CliToolArg::DesktopSpeaker => Self::DesktopSpeaker,
+            #[cfg(feature = "share-screen")]
+            CliToolArg::DesktopScreenShare => Self::DesktopScreenShare,
         }
     }
 }
@@ -472,7 +502,8 @@ fn system_completions(
 
 fn tool_name_completions(prefix: &str, replace_range: Range<usize>) -> Vec<CompletionItem> {
     ToolId::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|tool| tool.key().starts_with(prefix))
         .map(|tool| CompletionItem {
             label: tool.key().into(),
@@ -552,6 +583,29 @@ mod tests {
     fn complete_tool_name_after_enable() {
         let items = completions("/tools enable rea");
         assert!(items.iter().any(|item| item.label == "read-file"));
+    }
+
+    #[cfg(feature = "mic")]
+    #[test]
+    fn parse_tools_enable_desktop_microphone() {
+        let command = parse("/tools enable desktop-microphone")
+            .expect("slash command")
+            .expect("valid command");
+        assert_eq!(
+            command,
+            SlashCommand::Tools(ToolsCommand::Enable(ToolId::DesktopMicrophone))
+        );
+    }
+
+    #[cfg(feature = "share-screen")]
+    #[test]
+    fn complete_tool_name_after_enable_for_desktop_tool() {
+        let items = completions("/tools enable desktop-sc");
+        assert!(
+            items
+                .iter()
+                .any(|item| item.label == "desktop-screen-share")
+        );
     }
 
     #[test]

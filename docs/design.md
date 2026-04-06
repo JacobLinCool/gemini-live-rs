@@ -175,3 +175,27 @@ That crate is the natural home for:
 
 This keeps Discord product logic out of the desktop CLI and avoids trying to
 force Discord voice handling through the desktop-only `gemini-live-io` crate.
+
+### ADR-11: Low-coupling tool families live in `gemini-live-tools`
+
+The workspace now also has a dedicated `gemini-live-tools` crate for
+tool families whose execution model is reusable across hosts and does not
+depend on product-specific UI or long-lived device state.
+
+That crate is the natural home for:
+
+- workspace inspection and execution tools (`list_files`, `read_file`,
+  `run_command`)
+- shared tool selection data for those families
+- function declarations and validation shared across hosts
+
+The CLI continues to own host-specific composition, slash-command UX, desktop
+device wiring, and profile persistence. This keeps low-coupling tool logic out
+of the binary crate without pretending that desktop controls are already
+portable enough to deserve the same treatment.
+
+Desktop controls that mutate mic / speaker / screen-share state still remain
+CLI-local. They now cross the tool/runtime boundary through an explicit
+request-response port instead of reaching directly into terminal state. That
+keeps the execution contract testable without claiming the tool family is
+portable enough to move into `gemini-live-tools`.

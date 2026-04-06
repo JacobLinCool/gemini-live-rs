@@ -35,6 +35,7 @@
 
 mod app;
 mod desktop;
+mod desktop_control;
 mod input;
 mod media;
 mod outbound;
@@ -46,6 +47,7 @@ mod tooling;
 mod update;
 
 use std::io;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -54,6 +56,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use app::{App, AppCommand, summarize_optional_system_instruction};
+use desktop_control::DesktopControlPort;
 use gemini_live_runtime::{GeminiSessionDriver, ManagedRuntime, RuntimeSession};
 use startup::{StartupConfig, build_cli_setup, build_runtime_config, resolve_startup_config};
 
@@ -114,13 +117,25 @@ async fn run(
     mut profile_store: profile::ProfileStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir()?;
+    #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
+    let (desktop_control_port_impl, mut desktop_control_server) = desktop_control::channel();
+    #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
+    let desktop_control_port: Option<Arc<dyn DesktopControlPort>> =
+        Some(Arc::new(desktop_control_port_impl));
+    #[cfg(not(any(feature = "mic", feature = "speak", feature = "share-screen")))]
+    let desktop_control_port: Option<Arc<dyn DesktopControlPort>> = None;
+
     let mut app = App::new(
         &startup.connection_label(),
         startup.tool_profile,
         startup.system_instruction.clone(),
     );
     app.refresh_completions();
-    let initial_tool_runtime = tooling::ToolRuntime::new(workspace_root.clone(), app.active_tools)?;
+    let initial_tool_runtime = tooling::ToolRuntime::new(
+        workspace_root.clone(),
+        app.active_tools,
+        desktop_control_port.clone(),
+    )?;
 
     app.sys(format!("profile: {}", startup.profile_name));
     app.sys(format!("tools active: {}", app.active_tools.summary()));
@@ -169,7 +184,25 @@ async fn run(
         #[cfg(not(feature = "share-screen"))]
         let screen_event = std::future::pending::<Option<()>>();
 
+        #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
+        let desktop_control_event = desktop_control_server.recv();
+        #[cfg(not(any(feature = "mic", feature = "speak", feature = "share-screen")))]
+        let desktop_control_event =
+            std::future::pending::<Option<desktop_control::DesktopControlRequest>>();
+
         tokio::select! {
+            Some(request) = desktop_control_event => {
+                desktop::handle_control_request(
+                    request,
+                    &mut app,
+                    &mut profile_store,
+                    &runtime,
+                    #[cfg(any(feature = "mic", feature = "speak"))]
+                    &mut audio,
+                    #[cfg(feature = "share-screen")]
+                    &mut screen,
+                ).await;
+            }
             Some(Ok(ev)) = term_events.next() => {
                 if let Event::Key(key) = ev
                     && key.kind == KeyEventKind::Press
@@ -213,6 +246,7 @@ async fn run(
                                 runtime.replace_desired_tool_adapter(tooling::ToolRuntime::new(
                                     workspace_root.clone(),
                                     app.desired_tools,
+                                    desktop_control_port.clone(),
                                 )?);
                                 match runtime.apply().await {
                                     Ok(_report) => {

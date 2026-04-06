@@ -1770,6 +1770,7 @@ dependencies = [
  "gemini-live",
  "gemini-live-io",
  "gemini-live-runtime",
+ "gemini-live-tools",
  "hound",
  "ratatui",
  "reqwest 0.13.2",
@@ -1820,6 +1821,18 @@ dependencies = [
  "gemini-live",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "gemini-live-tools"
+version = "0.1.7"
+dependencies = [
+ "futures-util",
+ "gemini-live",
+ "gemini-live-runtime",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

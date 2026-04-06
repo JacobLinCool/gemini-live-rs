@@ -1,0 +1,16 @@
+[package]
+name = "gemini-live-tools"
+version = "0.1.7"
+description = "Reusable tool families for Gemini Live hosts"
+readme = "../../README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gemini-live = { workspace = true }
+gemini-live-runtime = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

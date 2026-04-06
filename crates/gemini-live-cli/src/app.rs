@@ -484,6 +484,7 @@ fn summarize_send_operation(operation: RuntimeSendOperation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use gemini_live::types::ApiError;
+    use gemini_live_tools::workspace::WorkspaceToolSelection;
 
     use super::*;
 
@@ -492,13 +493,13 @@ mod tests {
         let mut app = App::new("test", ToolProfile::default(), None);
 
         let command = app.apply_slash_command(slash::SlashCommand::Tools(
-            tooling::ToolsCommand::Enable(tooling::ToolId::ReadFile),
+            tooling::ToolsCommand::Enable(tooling::ToolId::RunCommand),
         ));
 
         assert_eq!(command, None);
-        assert!(app.desired_tools.read_file);
+        assert!(app.desired_tools.workspace.run_command);
         assert!(
-            matches!(app.messages.last(), Some(Msg { text, .. }) if text.contains("staged tool enable: read-file"))
+            matches!(app.messages.last(), Some(Msg { text, .. }) if text.contains("staged tool enable: run-command"))
         );
     }
 
@@ -575,7 +576,10 @@ mod tests {
     #[test]
     fn mark_session_config_applied_promotes_staged_values() {
         let mut app = App::new("test", ToolProfile::default(), None);
-        app.desired_tools.read_file = true;
+        app.desired_tools.workspace = WorkspaceToolSelection {
+            run_command: true,
+            ..WorkspaceToolSelection::default()
+        };
         app.desired_system_instruction = Some("be concise".into());
 
         app.mark_session_config_applied();
@@ -588,7 +592,7 @@ mod tests {
         assert!(
             app.messages
                 .iter()
-                .any(|msg| msg.text.contains("reconnected with tools: read-file"))
+                .any(|msg| msg.text.contains("run-command"))
         );
     }
 

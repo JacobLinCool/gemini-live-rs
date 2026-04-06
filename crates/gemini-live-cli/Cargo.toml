@@ -18,6 +18,7 @@ vertex-auth = ["gemini-live/vertex-auth"]
 gemini-live = { workspace = true }
 gemini-live-io = { workspace = true }
 gemini-live-runtime = { workspace = true }
+gemini-live-tools = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

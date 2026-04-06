@@ -1,42 +1,25 @@
-//! CLI-local tool catalog, slash-command parsing, and tool execution helpers.
+//! CLI-local tool profile and adapter composition.
 //!
-//! This module is the canonical home for the CLI's tool surface:
-//! - which Live API tools can be enabled
-//! - which slash commands manage the staged vs active tool profile
-//! - how local function calls are validated and executed
-//!
-//! Tool availability is part of the Live API session setup, so changes are
-//! staged first and only take effect after `/tools apply` reconnects with the
-//! new setup payload. When the server has already issued a resumption handle,
-//! the reconnect carries conversation state across that apply.
-//!
-//! `ToolRuntime` also implements the shared `gemini_live_runtime::ToolAdapter`
-//! contract so host-specific tool catalogs can be reused outside the desktop
-//! CLI.
+//! The CLI owns which tool families it exposes and how they are presented in
+//! the TUI. Reusable workspace-local tool definitions and execution now live in
+//! `gemini-live-tools`.
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use gemini_live::types::{
     FunctionCallRequest, FunctionDeclaration, FunctionResponse, GoogleSearchTool, Tool,
 };
 use gemini_live_runtime::{ToolAdapter, ToolDescriptor, ToolKind};
+use gemini_live_tools::workspace::{WorkspaceToolAdapter, WorkspaceToolId, WorkspaceToolSelection};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use serde_json::json;
 
-const DEFAULT_READ_LINE_COUNT: usize = 200;
-const MAX_READ_LINE_COUNT: usize = 400;
-const DEFAULT_LIST_MAX_ENTRIES: usize = 100;
-const MAX_LIST_ENTRIES: usize = 200;
-const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 10;
-const MAX_COMMAND_TIMEOUT_SECS: u64 = 30;
-const MAX_ARGV_LEN: usize = 32;
-const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+#[cfg(feature = "share-screen")]
+use crate::desktop_control::ScreenShareRequest;
+use crate::desktop_control::{DesktopControlAction, DesktopControlPort};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolId {
@@ -44,80 +27,269 @@ pub enum ToolId {
     ListFiles,
     ReadFile,
     RunCommand,
+    #[cfg(feature = "mic")]
+    DesktopMicrophone,
+    #[cfg(feature = "speak")]
+    DesktopSpeaker,
+    #[cfg(feature = "share-screen")]
+    DesktopScreenShare,
 }
 
 impl ToolId {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: &'static [Self] = &[
         Self::GoogleSearch,
         Self::ListFiles,
         Self::ReadFile,
         Self::RunCommand,
+        #[cfg(feature = "mic")]
+        Self::DesktopMicrophone,
+        #[cfg(feature = "speak")]
+        Self::DesktopSpeaker,
+        #[cfg(feature = "share-screen")]
+        Self::DesktopScreenShare,
     ];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::GoogleSearch => "google-search",
-            Self::ListFiles => "list-files",
-            Self::ReadFile => "read-file",
-            Self::RunCommand => "run-command",
+            Self::ListFiles => WorkspaceToolId::ListFiles.key(),
+            Self::ReadFile => WorkspaceToolId::ReadFile.key(),
+            Self::RunCommand => WorkspaceToolId::RunCommand.key(),
+            #[cfg(feature = "mic")]
+            Self::DesktopMicrophone => "desktop-microphone",
+            #[cfg(feature = "speak")]
+            Self::DesktopSpeaker => "desktop-speaker",
+            #[cfg(feature = "share-screen")]
+            Self::DesktopScreenShare => "desktop-screen-share",
         }
     }
 
     pub fn kind(self) -> &'static str {
-        match self {
-            Self::GoogleSearch => "built-in",
-            Self::ListFiles | Self::ReadFile | Self::RunCommand => "local",
+        if matches!(self, Self::GoogleSearch) {
+            "built-in"
+        } else {
+            "local"
         }
     }
 
     pub fn summary(self) -> &'static str {
         match self {
             Self::GoogleSearch => "Google-managed web search",
-            Self::ListFiles => "list workspace files and directories",
-            Self::ReadFile => "read UTF-8 text files under the workspace root",
-            Self::RunCommand => "run a non-interactive argv-only command under the workspace root",
+            Self::ListFiles => WorkspaceToolId::ListFiles.summary(),
+            Self::ReadFile => WorkspaceToolId::ReadFile.summary(),
+            Self::RunCommand => WorkspaceToolId::RunCommand.summary(),
+            #[cfg(feature = "mic")]
+            Self::DesktopMicrophone => "inspect and set microphone capture state",
+            #[cfg(feature = "speak")]
+            Self::DesktopSpeaker => "inspect and set speaker playback state",
+            #[cfg(feature = "share-screen")]
+            Self::DesktopScreenShare => "inspect screen targets and set screen-sharing state",
         }
     }
 
-    fn function_name(self) -> Option<&'static str> {
+    fn as_workspace_tool(self) -> Option<WorkspaceToolId> {
         match self {
             Self::GoogleSearch => None,
-            Self::ListFiles => Some("list_files"),
-            Self::ReadFile => Some("read_file"),
-            Self::RunCommand => Some("run_command"),
+            Self::ListFiles => Some(WorkspaceToolId::ListFiles),
+            Self::ReadFile => Some(WorkspaceToolId::ReadFile),
+            Self::RunCommand => Some(WorkspaceToolId::RunCommand),
+            #[cfg(feature = "mic")]
+            Self::DesktopMicrophone => None,
+            #[cfg(feature = "speak")]
+            Self::DesktopSpeaker => None,
+            #[cfg(feature = "share-screen")]
+            Self::DesktopScreenShare => None,
+        }
+    }
+
+    fn as_desktop_tool(self) -> Option<DesktopToolId> {
+        match self {
+            #[cfg(feature = "mic")]
+            Self::DesktopMicrophone => Some(DesktopToolId::Microphone),
+            #[cfg(feature = "speak")]
+            Self::DesktopSpeaker => Some(DesktopToolId::Speaker),
+            #[cfg(feature = "share-screen")]
+            Self::DesktopScreenShare => Some(DesktopToolId::ScreenShare),
+            _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopToolId {
+    #[cfg(feature = "mic")]
+    Microphone,
+    #[cfg(feature = "speak")]
+    Speaker,
+    #[cfg(feature = "share-screen")]
+    ScreenShare,
+}
+
+impl DesktopToolId {
+    const ALL: &'static [Self] = &[
+        #[cfg(feature = "mic")]
+        Self::Microphone,
+        #[cfg(feature = "speak")]
+        Self::Speaker,
+        #[cfg(feature = "share-screen")]
+        Self::ScreenShare,
+    ];
+
+    fn function_names(self) -> &'static [&'static str] {
+        match self {
+            #[cfg(feature = "mic")]
+            Self::Microphone => &["desktop_get_state", "desktop_set_microphone"],
+            #[cfg(feature = "speak")]
+            Self::Speaker => &["desktop_get_state", "desktop_set_speaker"],
+            #[cfg(feature = "share-screen")]
+            Self::ScreenShare => &[
+                "desktop_get_state",
+                "desktop_list_screen_targets",
+                "desktop_set_screen_share",
+            ],
+        }
+    }
+
+    fn matches_function_name(self, name: &str) -> bool {
+        self.function_names().contains(&name)
+    }
+
+    fn from_function_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|tool| tool.matches_function_name(name))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DesktopToolSelection {
+    #[cfg(feature = "mic")]
+    pub desktop_microphone: bool,
+    #[cfg(feature = "speak")]
+    pub desktop_speaker: bool,
+    #[cfg(feature = "share-screen")]
+    pub desktop_screen_share: bool,
+}
+
+impl Default for DesktopToolSelection {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "mic")]
+            desktop_microphone: true,
+            #[cfg(feature = "speak")]
+            desktop_speaker: true,
+            #[cfg(feature = "share-screen")]
+            desktop_screen_share: true,
+        }
+    }
+}
+
+impl DesktopToolSelection {
+    fn is_enabled(self, tool: DesktopToolId) -> bool {
+        match tool {
+            #[cfg(feature = "mic")]
+            DesktopToolId::Microphone => self.desktop_microphone,
+            #[cfg(feature = "speak")]
+            DesktopToolId::Speaker => self.desktop_speaker,
+            #[cfg(feature = "share-screen")]
+            DesktopToolId::ScreenShare => self.desktop_screen_share,
+        }
+    }
+
+    fn set(&mut self, tool: DesktopToolId, enabled: bool) -> bool {
+        match tool {
+            #[cfg(feature = "mic")]
+            DesktopToolId::Microphone => {
+                let changed = self.desktop_microphone != enabled;
+                self.desktop_microphone = enabled;
+                changed
+            }
+            #[cfg(feature = "speak")]
+            DesktopToolId::Speaker => {
+                let changed = self.desktop_speaker != enabled;
+                self.desktop_speaker = enabled;
+                changed
+            }
+            #[cfg(feature = "share-screen")]
+            DesktopToolId::ScreenShare => {
+                let changed = self.desktop_screen_share != enabled;
+                self.desktop_screen_share = enabled;
+                changed
+            }
+        }
+    }
+
+    fn function_declarations(self) -> Vec<FunctionDeclaration> {
+        let mut declarations = Vec::new();
+        if Self::any_enabled(self) {
+            declarations.push(desktop_get_state_declaration());
+        }
+        #[cfg(feature = "mic")]
+        if self.desktop_microphone {
+            declarations.push(desktop_set_microphone_declaration());
+        }
+        #[cfg(feature = "speak")]
+        if self.desktop_speaker {
+            declarations.push(desktop_set_speaker_declaration());
+        }
+        #[cfg(feature = "share-screen")]
+        if self.desktop_screen_share {
+            declarations.push(desktop_list_screen_targets_declaration());
+            declarations.push(desktop_set_screen_share_declaration());
+        }
+
+        declarations
+    }
+
+    fn any_enabled(self) -> bool {
+        DesktopToolId::ALL
+            .iter()
+            .copied()
+            .any(|tool| self.is_enabled(tool))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct ToolProfile {
     pub google_search: bool,
-    pub list_files: bool,
-    pub read_file: bool,
-    pub run_command: bool,
+    #[serde(flatten)]
+    pub workspace: WorkspaceToolSelection,
+    #[serde(flatten)]
+    pub desktop: DesktopToolSelection,
 }
 
 impl ToolProfile {
     pub fn is_enabled(self, tool: ToolId) -> bool {
         match tool {
             ToolId::GoogleSearch => self.google_search,
-            ToolId::ListFiles => self.list_files,
-            ToolId::ReadFile => self.read_file,
-            ToolId::RunCommand => self.run_command,
+            _ if tool.as_workspace_tool().is_some() => self
+                .workspace
+                .is_enabled(tool.as_workspace_tool().expect("workspace tool id")),
+            _ => self
+                .desktop
+                .is_enabled(tool.as_desktop_tool().expect("desktop tool id")),
         }
     }
 
     pub fn set(&mut self, tool: ToolId, enabled: bool) -> bool {
-        let slot = match tool {
-            ToolId::GoogleSearch => &mut self.google_search,
-            ToolId::ListFiles => &mut self.list_files,
-            ToolId::ReadFile => &mut self.read_file,
-            ToolId::RunCommand => &mut self.run_command,
-        };
-        let changed = *slot != enabled;
-        *slot = enabled;
-        changed
+        match tool {
+            ToolId::GoogleSearch => {
+                let changed = self.google_search != enabled;
+                self.google_search = enabled;
+                changed
+            }
+            _ if tool.as_workspace_tool().is_some() => self.workspace.set(
+                tool.as_workspace_tool().expect("workspace tool id"),
+                enabled,
+            ),
+            _ => self
+                .desktop
+                .set(tool.as_desktop_tool().expect("desktop tool id"), enabled),
+        }
     }
 
     pub fn toggle(&mut self, tool: ToolId) -> bool {
@@ -128,7 +300,8 @@ impl ToolProfile {
 
     pub fn summary(self) -> String {
         let enabled = ToolId::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|tool| self.is_enabled(*tool))
             .map(ToolId::key)
             .collect::<Vec<_>>();
@@ -144,21 +317,11 @@ impl ToolProfile {
         if self.google_search {
             tools.push(Tool::GoogleSearch(GoogleSearchTool {}));
         }
-
-        let mut functions = Vec::new();
-        if self.list_files {
-            functions.push(list_files_declaration());
-        }
-        if self.read_file {
-            functions.push(read_file_declaration());
-        }
-        if self.run_command {
-            functions.push(run_command_declaration());
-        }
+        let mut functions = self.workspace.function_declarations();
+        functions.extend(self.desktop.function_declarations());
         if !functions.is_empty() {
             tools.push(Tool::FunctionDeclarations(functions));
         }
-
         (!tools.is_empty()).then_some(tools)
     }
 }
@@ -186,7 +349,8 @@ pub fn status_lines(active: ToolProfile, desired: ToolProfile) -> Vec<String> {
 
 pub fn catalog_lines(active: ToolProfile, desired: ToolProfile) -> Vec<String> {
     ToolId::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .map(|tool| {
             let state = match (active.is_enabled(tool), desired.is_enabled(tool)) {
                 (true, true) => "active",
@@ -205,238 +369,77 @@ pub fn catalog_lines(active: ToolProfile, desired: ToolProfile) -> Vec<String> {
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolRuntime {
     profile: ToolProfile,
-    workspace_root: PathBuf,
-    workspace_root_real: PathBuf,
+    workspace: WorkspaceToolAdapter,
+    desktop_control: Option<Arc<dyn DesktopControlPort>>,
 }
 
 impl ToolRuntime {
-    pub fn new(workspace_root: PathBuf, profile: ToolProfile) -> io::Result<Self> {
-        let workspace_root_real = workspace_root.canonicalize()?;
+    pub fn new(
+        workspace_root: PathBuf,
+        profile: ToolProfile,
+        desktop_control: Option<Arc<dyn DesktopControlPort>>,
+    ) -> io::Result<Self> {
         Ok(Self {
             profile,
-            workspace_root,
-            workspace_root_real,
+            workspace: WorkspaceToolAdapter::new(workspace_root, profile.workspace)?,
+            desktop_control,
         })
     }
 
     pub async fn execute_call(&self, call: FunctionCallRequest) -> FunctionResponse {
-        let result = match ToolId::ALL
-            .into_iter()
-            .find(|tool| tool.function_name() == Some(call.name.as_str()))
-        {
-            Some(tool) if self.profile.is_enabled(tool) => {
-                self.execute_enabled_call(tool, call.args.as_object()).await
-            }
-            Some(_) => Err(format!(
-                "tool `{}` is not enabled in the active profile",
-                call.name
-            )),
-            None => Err(format!("unknown local tool `{}`", call.name)),
+        if WorkspaceToolId::from_function_name(call.name.as_str()).is_some() {
+            return self.workspace.execute_call(call).await;
+        }
+        if let Some(tool) = DesktopToolId::from_function_name(call.name.as_str()) {
+            return self.execute_desktop_call(tool, call).await;
+        }
+
+        let name = call.name.clone();
+        FunctionResponse {
+            id: call.id,
+            name,
+            response: json!({
+                "ok": false,
+                "error": {
+                    "message": format!("unknown local tool `{}`", call.name),
+                },
+            }),
+        }
+    }
+
+    async fn execute_desktop_call(
+        &self,
+        tool: DesktopToolId,
+        call: FunctionCallRequest,
+    ) -> FunctionResponse {
+        if !self.profile.desktop.is_enabled(tool) {
+            return error_response(
+                call,
+                format!(
+                    "tool `{}` is not enabled in the active profile",
+                    tool_name(tool)
+                ),
+            );
+        }
+        let Some(port) = &self.desktop_control else {
+            return error_response(call, "desktop control host is unavailable".into());
+        };
+
+        let result = match desktop_action_from_call(&call) {
+            Ok(action) => port
+                .execute(action)
+                .await
+                .map(|response| response.into_json())
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
         };
 
         match result {
-            Ok(response) => FunctionResponse {
-                id: call.id,
-                name: call.name,
-                response: json!({
-                    "ok": true,
-                    "result": response,
-                }),
-            },
-            Err(message) => FunctionResponse {
-                id: call.id,
-                name: call.name,
-                response: json!({
-                    "ok": false,
-                    "error": {
-                        "message": message,
-                    },
-                }),
-            },
-        }
-    }
-
-    async fn execute_enabled_call(
-        &self,
-        tool: ToolId,
-        args: Option<&Map<String, Value>>,
-    ) -> Result<Value, String> {
-        let args = args.ok_or("tool arguments must be a JSON object")?;
-        match tool {
-            ToolId::GoogleSearch => {
-                Err("google-search is server-managed and cannot be executed locally".into())
-            }
-            ToolId::ListFiles => self.list_files(args),
-            ToolId::ReadFile => self.read_file(args),
-            ToolId::RunCommand => self.run_command(args).await,
-        }
-    }
-
-    fn list_files(&self, args: &Map<String, Value>) -> Result<Value, String> {
-        let path = resolve_optional_string(args, "path")?.unwrap_or(".");
-        let recursive = resolve_optional_bool(args, "recursive")?.unwrap_or(false);
-        let max_entries = resolve_optional_usize(args, "maxEntries", MAX_LIST_ENTRIES)?
-            .unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
-
-        let dir = self.resolve_existing_directory(path)?;
-        let mut entries = Vec::new();
-        collect_entries(
-            &dir,
-            recursive,
-            max_entries,
-            &self.workspace_root_real,
-            &mut entries,
-        )?;
-
-        Ok(json!({
-            "path": self.display_path(&dir),
-            "recursive": recursive,
-            "entries": entries,
-            "truncated": entries.len() >= max_entries,
-        }))
-    }
-
-    fn read_file(&self, args: &Map<String, Value>) -> Result<Value, String> {
-        let path = resolve_required_string(args, "path")?;
-        let start_line = resolve_optional_usize(args, "startLine", usize::MAX)?.unwrap_or(1);
-        let line_count = resolve_optional_usize(args, "lineCount", MAX_READ_LINE_COUNT)?
-            .unwrap_or(DEFAULT_READ_LINE_COUNT);
-        if start_line == 0 {
-            return Err("`startLine` must be at least 1".into());
-        }
-
-        let file = self.resolve_existing_file(path)?;
-        let content = std::fs::read_to_string(&file)
-            .map_err(|e| format!("failed to read `{}`: {e}", self.display_path(&file)))?;
-        let lines = content.lines().collect::<Vec<_>>();
-        let start_index = start_line - 1;
-        let end_index = start_index.saturating_add(line_count).min(lines.len());
-        let slice = if start_index >= lines.len() {
-            &[][..]
-        } else {
-            &lines[start_index..end_index]
-        };
-
-        Ok(json!({
-            "path": self.display_path(&file),
-            "startLine": start_line,
-            "endLine": if slice.is_empty() { start_index } else { start_index + slice.len() },
-            "content": slice.join("\n"),
-            "truncated": end_index < lines.len(),
-        }))
-    }
-
-    async fn run_command(&self, args: &Map<String, Value>) -> Result<Value, String> {
-        let argv = resolve_required_string_array(args, "argv")?;
-        if argv.len() > MAX_ARGV_LEN {
-            return Err(format!("`argv` may contain at most {MAX_ARGV_LEN} items"));
-        }
-        let cwd = resolve_optional_string(args, "cwd")?.unwrap_or(".");
-        let timeout_secs = resolve_optional_u64(args, "timeoutSecs", MAX_COMMAND_TIMEOUT_SECS)?
-            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS);
-        let cwd = self.resolve_existing_directory(cwd)?;
-
-        let mut command = Command::new(&argv[0]);
-        command.args(&argv[1..]);
-        command.current_dir(&cwd);
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.kill_on_drop(true);
-
-        let mut child = command.spawn().map_err(|e| {
-            format!(
-                "failed to start `{}` in `{}`: {e}",
-                argv[0],
-                self.display_path(&cwd)
-            )
-        })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("failed to capture child stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or("failed to capture child stderr")?;
-        let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
-        let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-
-        let (status, timed_out) = tokio::select! {
-            status = child.wait() => (
-                status.map_err(|e| format!("failed while waiting for `{}`: {e}", argv[0]))?,
-                false,
-            ),
-            _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
-                child.kill().await.ok();
-                let status = child
-                    .wait()
-                    .await
-                    .map_err(|e| format!("failed while terminating `{}`: {e}", argv[0]))?;
-                (status, true)
-            }
-        };
-
-        let (stdout, stdout_truncated) = join_read_task(stdout_task, "stdout").await?;
-        let (stderr, stderr_truncated) = join_read_task(stderr_task, "stderr").await?;
-
-        Ok(json!({
-            "argv": argv,
-            "cwd": self.display_path(&cwd),
-            "timedOut": timed_out,
-            "timeoutSecs": timeout_secs,
-            "success": status.success() && !timed_out,
-            "exitCode": status.code(),
-            "stdout": String::from_utf8_lossy(&stdout),
-            "stderr": String::from_utf8_lossy(&stderr),
-            "stdoutTruncated": stdout_truncated,
-            "stderrTruncated": stderr_truncated,
-        }))
-    }
-
-    fn resolve_existing_directory(&self, raw: &str) -> Result<PathBuf, String> {
-        let path = self.resolve_existing_path(raw)?;
-        if !path.is_dir() {
-            return Err(format!("`{}` is not a directory", self.display_path(&path)));
-        }
-        Ok(path)
-    }
-
-    fn resolve_existing_file(&self, raw: &str) -> Result<PathBuf, String> {
-        let path = self.resolve_existing_path(raw)?;
-        if !path.is_file() {
-            return Err(format!("`{}` is not a file", self.display_path(&path)));
-        }
-        Ok(path)
-    }
-
-    fn resolve_existing_path(&self, raw: &str) -> Result<PathBuf, String> {
-        let candidate = normalize_path(&self.workspace_root.join(raw));
-        let canonical = candidate.canonicalize().map_err(|e| {
-            format!(
-                "failed to resolve `{}` under `{}`: {e}",
-                raw,
-                self.workspace_root.display()
-            )
-        })?;
-        if !canonical.starts_with(&self.workspace_root_real) {
-            return Err(format!(
-                "`{}` resolves outside the workspace root `{}`",
-                raw,
-                self.workspace_root.display()
-            ));
-        }
-        Ok(canonical)
-    }
-
-    fn display_path(&self, path: &Path) -> String {
-        match path.strip_prefix(&self.workspace_root_real) {
-            Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
-            Ok(relative) => relative.display().to_string(),
-            Err(_) => path.display().to_string(),
+            Ok(response) => success_response(call, response),
+            Err(error) => error_response(call, error),
         }
     }
 }
@@ -448,13 +451,15 @@ impl ToolAdapter for ToolRuntime {
 
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         ToolId::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .map(|tool| ToolDescriptor {
                 key: tool.key().to_string(),
                 summary: tool.summary().to_string(),
-                kind: match tool {
-                    ToolId::GoogleSearch => ToolKind::BuiltIn,
-                    ToolId::ListFiles | ToolId::ReadFile | ToolId::RunCommand => ToolKind::Local,
+                kind: if matches!(tool, ToolId::GoogleSearch) {
+                    ToolKind::BuiltIn
+                } else {
+                    ToolKind::Local
                 },
             })
             .collect()
@@ -468,26 +473,98 @@ impl ToolAdapter for ToolRuntime {
     }
 }
 
-fn list_files_declaration() -> FunctionDeclaration {
+fn success_response(call: FunctionCallRequest, response: serde_json::Value) -> FunctionResponse {
+    FunctionResponse {
+        id: call.id,
+        name: call.name,
+        response: json!({
+            "ok": true,
+            "result": response,
+        }),
+    }
+}
+
+fn error_response(call: FunctionCallRequest, message: String) -> FunctionResponse {
+    FunctionResponse {
+        id: call.id,
+        name: call.name,
+        response: json!({
+            "ok": false,
+            "error": {
+                "message": message,
+            },
+        }),
+    }
+}
+
+fn tool_name(tool: DesktopToolId) -> &'static str {
+    match tool {
+        #[cfg(feature = "mic")]
+        DesktopToolId::Microphone => "desktop-microphone",
+        #[cfg(feature = "speak")]
+        DesktopToolId::Speaker => "desktop-speaker",
+        #[cfg(feature = "share-screen")]
+        DesktopToolId::ScreenShare => "desktop-screen-share",
+    }
+}
+
+fn desktop_action_from_call(call: &FunctionCallRequest) -> Result<DesktopControlAction, String> {
+    let args = call.args.as_object();
+    match call.name.as_str() {
+        "desktop_get_state" => Ok(DesktopControlAction::GetState),
+        #[cfg(feature = "mic")]
+        "desktop_set_microphone" => Ok(DesktopControlAction::SetMicrophone {
+            enabled: resolve_required_bool(args, "enabled")?,
+        }),
+        #[cfg(feature = "speak")]
+        "desktop_set_speaker" => Ok(DesktopControlAction::SetSpeaker {
+            enabled: resolve_required_bool(args, "enabled")?,
+        }),
+        #[cfg(feature = "share-screen")]
+        "desktop_list_screen_targets" => Ok(DesktopControlAction::ListScreenTargets),
+        #[cfg(feature = "share-screen")]
+        "desktop_set_screen_share" => {
+            let enabled = resolve_required_bool(args, "enabled")?;
+            let target_id = resolve_optional_usize(args, "targetId")?;
+            let interval_secs = resolve_optional_f64(args, "intervalSecs")?;
+            if enabled && target_id.is_none() {
+                return Err("`targetId` is required when enabling screen share".into());
+            }
+            Ok(DesktopControlAction::SetScreenShare(ScreenShareRequest {
+                enabled,
+                target_id,
+                interval_secs,
+            }))
+        }
+        _ => Err(format!("unknown desktop tool `{}`", call.name)),
+    }
+}
+
+fn desktop_get_state_declaration() -> FunctionDeclaration {
     FunctionDeclaration {
-        name: "list_files".into(),
-        description: "List files and directories under the current workspace root. Use relative paths, keep recursive scans targeted, and inspect the result before reading or executing anything.".into(),
+        name: "desktop_get_state".into(),
+        description: "Inspect the current desktop host state before changing microphone, speaker, or screen-sharing settings.".into(),
         parameters: json!({
             "type": "object",
+            "properties": {}
+        }),
+        scheduling: None,
+        behavior: None,
+    }
+}
+
+#[cfg(feature = "mic")]
+fn desktop_set_microphone_declaration() -> FunctionDeclaration {
+    FunctionDeclaration {
+        name: "desktop_set_microphone".into(),
+        description: "Set whether the desktop CLI should capture microphone audio and stream it to the current Gemini Live session.".into(),
+        parameters: json!({
+            "type": "object",
+            "required": ["enabled"],
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative directory to list. Defaults to the workspace root."
-                },
-                "recursive": {
+                "enabled": {
                     "type": "boolean",
-                    "description": "Whether to recurse into subdirectories. Defaults to false."
-                },
-                "maxEntries": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_LIST_ENTRIES,
-                    "description": "Maximum number of returned entries. Defaults to 100."
+                    "description": "Whether microphone capture should be enabled."
                 }
             }
         }),
@@ -496,28 +573,20 @@ fn list_files_declaration() -> FunctionDeclaration {
     }
 }
 
-fn read_file_declaration() -> FunctionDeclaration {
+#[cfg(feature = "speak")]
+fn desktop_set_speaker_declaration() -> FunctionDeclaration {
     FunctionDeclaration {
-        name: "read_file".into(),
-        description: "Read a UTF-8 text file under the current workspace root. Prefer this after list_files so the path is already known. Returns numbered slices rather than the entire file when line ranges are provided.".into(),
+        name: "desktop_set_speaker".into(),
+        description:
+            "Set whether the desktop CLI should play model audio through the local speaker output."
+                .into(),
         parameters: json!({
             "type": "object",
-            "required": ["path"],
+            "required": ["enabled"],
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative path to a UTF-8 text file."
-                },
-                "startLine": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based line number to start reading from. Defaults to 1."
-                },
-                "lineCount": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_READ_LINE_COUNT,
-                    "description": "Maximum number of lines to return. Defaults to 200."
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether speaker playback should be enabled."
                 }
             }
         }),
@@ -526,30 +595,43 @@ fn read_file_declaration() -> FunctionDeclaration {
     }
 }
 
-fn run_command_declaration() -> FunctionDeclaration {
+#[cfg(feature = "share-screen")]
+fn desktop_list_screen_targets_declaration() -> FunctionDeclaration {
     FunctionDeclaration {
-        name: "run_command".into(),
-        description: "Run a non-interactive command under the current workspace root without using a shell. Use this only when file inspection is insufficient and keep commands short, deterministic, and argv-based.".into(),
+        name: "desktop_list_screen_targets".into(),
+        description:
+            "List available desktop capture targets before enabling or retargeting screen sharing."
+                .into(),
         parameters: json!({
             "type": "object",
-            "required": ["argv"],
+            "properties": {}
+        }),
+        scheduling: None,
+        behavior: None,
+    }
+}
+
+#[cfg(feature = "share-screen")]
+fn desktop_set_screen_share_declaration() -> FunctionDeclaration {
+    FunctionDeclaration {
+        name: "desktop_set_screen_share".into(),
+        description: "Set whether the desktop CLI should share a screen target with the current Gemini Live session. Always list targets first before enabling.".into(),
+        parameters: json!({
+            "type": "object",
+            "required": ["enabled"],
             "properties": {
-                "argv": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_ARGV_LEN,
-                    "items": { "type": "string" },
-                    "description": "Program name plus argv items. Shell syntax is not supported."
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether screen sharing should be enabled."
                 },
-                "cwd": {
-                    "type": "string",
-                    "description": "Workspace-relative working directory. Defaults to the workspace root."
-                },
-                "timeoutSecs": {
+                "targetId": {
                     "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_COMMAND_TIMEOUT_SECS,
-                    "description": "Execution timeout in seconds. Defaults to 10."
+                    "minimum": 0,
+                    "description": "Desktop capture target id returned by desktop_list_screen_targets. Required when enabling."
+                },
+                "intervalSecs": {
+                    "type": "number",
+                    "description": "Seconds between captured frames. Must be greater than 0. Defaults to 1.0."
                 }
             }
         }),
@@ -558,206 +640,79 @@ fn run_command_declaration() -> FunctionDeclaration {
     }
 }
 
-fn collect_entries(
-    root: &Path,
-    recursive: bool,
-    max_entries: usize,
-    workspace_root: &Path,
-    out: &mut Vec<Value>,
-) -> Result<(), String> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("failed to read directory `{}`: {e}", dir.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to iterate directory `{}`: {e}", dir.display()))?;
-        entries.sort_by_key(|entry| entry.file_name());
-
-        for entry in entries {
-            if out.len() >= max_entries {
-                return Ok(());
-            }
-
-            let path = entry.path();
-            let canonical = path.canonicalize().unwrap_or(path.clone());
-            if !canonical.starts_with(workspace_root) {
-                continue;
-            }
-
-            let file_type = entry
-                .file_type()
-                .map_err(|e| format!("failed to inspect `{}`: {e}", path.display()))?;
-            let kind = if file_type.is_dir() {
-                "dir"
-            } else if file_type.is_file() {
-                "file"
-            } else if file_type.is_symlink() {
-                "symlink"
-            } else {
-                "other"
-            };
-            let relative = canonical
-                .strip_prefix(workspace_root)
-                .unwrap_or(canonical.as_path());
-            let metadata = entry.metadata().ok();
-            out.push(json!({
-                "path": if relative.as_os_str().is_empty() {
-                    ".".to_string()
-                } else {
-                    relative.display().to_string()
-                },
-                "kind": kind,
-                "sizeBytes": metadata.filter(|_| file_type.is_file()).map(|m| m.len()),
-            }));
-
-            if recursive && file_type.is_dir() {
-                stack.push(canonical);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn read_limited<R>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    let mut truncated = false;
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            break;
-        }
-        if buf.len() < limit {
-            let remaining = limit - buf.len();
-            let to_take = remaining.min(read);
-            buf.extend_from_slice(&chunk[..to_take]);
-            if to_take < read {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
-    }
-    Ok((buf, truncated))
-}
-
-async fn join_read_task(
-    task: tokio::task::JoinHandle<io::Result<(Vec<u8>, bool)>>,
-    label: &str,
-) -> Result<(Vec<u8>, bool), String> {
-    task.await
-        .map_err(|e| format!("failed to join child {label} reader: {e}"))?
-        .map_err(|e| format!("failed to read child {label}: {e}"))
-}
-
-fn resolve_required_string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
-    resolve_optional_string(args, key)?.ok_or_else(|| format!("missing required string `{key}`"))
-}
-
-fn resolve_optional_string<'a>(
-    args: &'a Map<String, Value>,
+fn resolve_required_bool(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
-) -> Result<Option<&'a str>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(format!("`{key}` must be a string")),
-    }
-}
-
-fn resolve_optional_bool(args: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
-    match args.get(key) {
-        None => Ok(None),
-        Some(Value::Bool(value)) => Ok(Some(*value)),
+) -> Result<bool, String> {
+    match args.and_then(|args| args.get(key)) {
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
         Some(_) => Err(format!("`{key}` must be a boolean")),
+        None => Err(format!("missing required boolean `{key}`")),
     }
 }
 
-fn resolve_optional_u64(
-    args: &Map<String, Value>,
+#[cfg(feature = "share-screen")]
+fn resolve_optional_usize(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
-    max: u64,
-) -> Result<Option<u64>, String> {
-    match args.get(key) {
+) -> Result<Option<usize>, String> {
+    match args.and_then(|args| args.get(key)) {
         None => Ok(None),
-        Some(Value::Number(value)) => {
+        Some(serde_json::Value::Number(value)) => {
             let Some(number) = value.as_u64() else {
                 return Err(format!("`{key}` must be a non-negative integer"));
             };
-            if number == 0 {
-                return Err(format!("`{key}` must be at least 1"));
-            }
-            if number > max {
-                return Err(format!("`{key}` must be at most {max}"));
-            }
-            Ok(Some(number))
+            Ok(Some(number as usize))
         }
         Some(_) => Err(format!("`{key}` must be an integer")),
     }
 }
 
-fn resolve_optional_usize(
-    args: &Map<String, Value>,
+#[cfg(feature = "share-screen")]
+fn resolve_optional_f64(
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
-    max: usize,
-) -> Result<Option<usize>, String> {
-    resolve_optional_u64(args, key, max as u64).map(|value| value.map(|v| v as usize))
-}
-
-fn resolve_required_string_array(
-    args: &Map<String, Value>,
-    key: &str,
-) -> Result<Vec<String>, String> {
-    let Some(value) = args.get(key) else {
-        return Err(format!("missing required array `{key}`"));
-    };
-    let Some(items) = value.as_array() else {
-        return Err(format!("`{key}` must be an array of strings"));
-    };
-    if items.is_empty() {
-        return Err(format!("`{key}` must contain at least one string"));
-    }
-    items
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("`{key}` must contain only strings"))
-        })
-        .collect()
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
+) -> Result<Option<f64>, String> {
+    match args.and_then(|args| args.get(key)) {
+        None => Ok(None),
+        Some(serde_json::Value::Number(value)) => {
+            let Some(number) = value.as_f64() else {
+                return Err(format!("`{key}` must be a number"));
+            };
+            if number <= 0.0 {
+                return Err(format!("`{key}` must be greater than 0"));
             }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                normalized.push(component.as_os_str())
-            }
+            Ok(Some(number))
         }
+        Some(_) => Err(format!("`{key}` must be a number")),
     }
-    normalized
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn desktop_tools_disabled() -> DesktopToolSelection {
+        DesktopToolSelection {
+            #[cfg(feature = "mic")]
+            desktop_microphone: false,
+            #[cfg(feature = "speak")]
+            desktop_speaker: false,
+            #[cfg(feature = "share-screen")]
+            desktop_screen_share: false,
+        }
+    }
+
     #[test]
-    fn tool_profile_builds_google_search_and_functions() {
+    fn tool_profile_builds_google_search_and_local_functions() {
         let profile = ToolProfile {
             google_search: true,
-            list_files: true,
-            read_file: true,
-            run_command: false,
+            workspace: WorkspaceToolSelection {
+                list_files: true,
+                read_file: true,
+                run_command: false,
+            },
+            desktop: desktop_tools_disabled(),
         };
 
         let tools = profile.build_live_tools().expect("live tools");
@@ -766,7 +721,7 @@ mod tests {
             Tool::FunctionDeclarations(functions) => {
                 let names = functions
                     .iter()
-                    .map(|f| f.name.as_str())
+                    .map(|function| function.name.as_str())
                     .collect::<Vec<_>>();
                 assert_eq!(names, vec!["list_files", "read_file"]);
             }
@@ -778,10 +733,115 @@ mod tests {
     fn catalog_lists_staged_state() {
         let active = ToolProfile::default();
         let desired = ToolProfile {
-            read_file: true,
+            workspace: WorkspaceToolSelection {
+                run_command: true,
+                ..WorkspaceToolSelection::default()
+            },
+            desktop: active.desktop,
             ..ToolProfile::default()
         };
         let lines = catalog_lines(active, desired);
-        assert!(lines.iter().any(|line| line.contains("read-file [staged")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("run-command [staged"))
+        );
+    }
+
+    #[test]
+    fn default_tool_profile_matches_cli_safety_defaults() {
+        let profile = ToolProfile::default();
+
+        assert!(!profile.google_search);
+        assert!(profile.workspace.list_files);
+        assert!(profile.workspace.read_file);
+        assert!(!profile.workspace.run_command);
+        #[cfg(feature = "mic")]
+        assert!(profile.desktop.desktop_microphone);
+        #[cfg(feature = "speak")]
+        assert!(profile.desktop.desktop_speaker);
+        #[cfg(feature = "share-screen")]
+        assert!(profile.desktop.desktop_screen_share);
+    }
+
+    #[test]
+    fn tool_schemas_avoid_unsupported_exclusive_minimum_keyword() {
+        let tools = ToolProfile::default()
+            .build_live_tools()
+            .expect("live tools");
+        for tool in tools {
+            let Tool::FunctionDeclarations(functions) = tool else {
+                continue;
+            };
+            for function in functions {
+                assert!(
+                    !contains_json_key(&function.parameters, "exclusiveMinimum"),
+                    "function `{}` uses unsupported `exclusiveMinimum`",
+                    function.name
+                );
+            }
+        }
+    }
+
+    #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
+    #[test]
+    fn desktop_tools_declare_shared_state_once() {
+        let mut desktop = DesktopToolSelection::default();
+        #[cfg(feature = "mic")]
+        {
+            desktop.desktop_microphone = true;
+        }
+        #[cfg(feature = "speak")]
+        {
+            desktop.desktop_speaker = true;
+        }
+        #[cfg(feature = "share-screen")]
+        {
+            desktop.desktop_screen_share = true;
+        }
+
+        let tools = ToolProfile {
+            desktop,
+            ..ToolProfile::default()
+        }
+        .build_live_tools()
+        .expect("desktop live tools");
+
+        let Tool::FunctionDeclarations(functions) = &tools[0] else {
+            panic!("expected function declarations");
+        };
+        let names = functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "desktop_get_state")
+                .count(),
+            1
+        );
+        #[cfg(feature = "mic")]
+        assert!(names.contains(&"desktop_set_microphone"));
+        #[cfg(feature = "speak")]
+        assert!(names.contains(&"desktop_set_speaker"));
+        #[cfg(feature = "share-screen")]
+        {
+            assert!(names.contains(&"desktop_list_screen_targets"));
+            assert!(names.contains(&"desktop_set_screen_share"));
+        }
+    }
+
+    fn contains_json_key(value: &serde_json::Value, key: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|value| contains_json_key(value, key))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().any(|value| contains_json_key(value, key))
+            }
+            _ => false,
+        }
     }
 }

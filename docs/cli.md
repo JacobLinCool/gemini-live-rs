@@ -140,7 +140,7 @@ spaces are not supported yet.
 | `/system apply` | Reconnect the Live session with the staged system instruction and staged tools, carrying conversation state when a resume handle is available. |
 | `/tools` | Show active vs staged tool profile. |
 | `/tools list` | List the known tools and their current state (`active`, `staged`, `off`). |
-| `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `list-files`, `read-file`, `run-command`. |
+| `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `list-files`, `read-file`, `run-command`, plus feature-gated CLI-local desktop tools such as `desktop-microphone`, `desktop-speaker`, and `desktop-screen-share`. |
 | `/tools disable <tool>` | Stage a tool removal for the next applied session. |
 | `/tools toggle <tool>` | Flip a tool in the staged profile. |
 | `/tools apply` | Reconnect the Live session with the staged tool profile, carrying conversation state when a resume handle is available. |
@@ -188,7 +188,9 @@ input.rs                 Single-line editor wrapper built on `tui-textarea`
 slash.rs                 Structured slash-command parsing (`clap`) + completion model
 media.rs                 @file loading: image/audio detection, WAV decoding, mono mixdown
 outbound.rs              User-input/media send ordering above `RuntimeSession`
-tooling.rs               CLI-local tool catalog + local ToolAdapter implementation
+tooling.rs               CLI-local tool profile + ToolAdapter composition over shared tool families
+desktop_control.rs       CLI-local request-response port for model-invoked desktop controls
+gemini-live-tools        Shared workspace tool declarations and executors reused by hosts
 gemini-live-runtime      Shared staged-setup + managed runtime orchestration reused by hosts
 gemini-live-io           Shared desktop mic / speaker / screen adapters reused by hosts
 ```
@@ -218,6 +220,9 @@ than the canonical home of code-representable behavior.
 - Tool-profile changes are session-level and therefore require `/tools apply`.
 - System-instruction changes are also setup-level and therefore require
   `/system apply`.
+- CLI-local desktop tools are still part of the staged tool profile, so the
+  model cannot call them until that profile has been applied to a live
+  session.
 - `/tools apply` and `/system apply` use session resumption carryover when the
   server has already issued a resume handle; applying immediately after first
   connect may still fail until that handle exists.

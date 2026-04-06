@@ -23,6 +23,14 @@
 //! - microphone / speaker auto-start flags
 //! - optional screen-share auto-start settings
 //!
+//! The built-in tool-profile defaults are:
+//!
+//! - `list-files = true`
+//! - `read-file = true`
+//! - `run-command = false`
+//! - desktop control tools enabled when their Cargo features are enabled
+//! - `google-search = false`
+//!
 //! Startup precedence is `environment > active profile > built-in defaults`,
 //! and the resolved values are written back into the active profile.
 
@@ -448,6 +456,8 @@ fn build_vertex_adc_auth() -> Result<Auth, CliConfigError> {
 mod tests {
     use std::collections::HashMap;
 
+    use gemini_live_tools::workspace::WorkspaceToolSelection;
+
     use super::*;
 
     fn empty_profile() -> profile::ProfileConfig {
@@ -566,7 +576,10 @@ mod tests {
             system_instruction: Some("Profile instruction".into()),
             gemini_api_key: Some("profile-key".into()),
             tools: Some(ToolProfile {
-                read_file: true,
+                workspace: WorkspaceToolSelection {
+                    read_file: true,
+                    ..WorkspaceToolSelection::default()
+                },
                 ..ToolProfile::default()
             }),
             mic_enabled: Some(true),
@@ -582,7 +595,7 @@ mod tests {
             startup.system_instruction.as_deref(),
             Some("Profile instruction")
         );
-        assert!(startup.tool_profile.read_file);
+        assert!(startup.tool_profile.workspace.read_file);
         #[cfg(feature = "mic")]
         assert!(startup.mic_enabled);
         assert!(matches!(startup.transport.auth, Auth::ApiKey(_)));

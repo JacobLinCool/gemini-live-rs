@@ -1,6 +1,6 @@
 //! Host-managed runtime that owns session forwarding and tool-call orchestration.
 //!
-//! [`LiveRuntime`](crate::LiveRuntime) remains the low-level staged-session
+//! [`LiveRuntime`] remains the low-level staged-session
 //! primitive. This module layers on the long-lived async tasks that hosts would
 //! otherwise duplicate:
 //!

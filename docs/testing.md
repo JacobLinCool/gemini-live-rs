@@ -1,6 +1,6 @@
 # Testing Strategy
 
-> Test coverage tracking. Planned tests are tracked in [`roadmap.md`](roadmap.md) items **T-1** through **T-7**.
+> Test coverage tracking. Planned tests are tracked in [`roadmap.md`](roadmap.md) items **T-1** through **T-8**.
 
 ---
 
@@ -16,10 +16,11 @@
 | **Unit** | IO crate: desktop audio resample helpers | 2 |
 | **Unit** | Runtime crate: staged setup patching + resumed/fresh apply semantics + managed runtime event/tool orchestration | 7 |
 | **Unit** | CLI: startup config + top-level CLI parsing + slash parser/completion + render status + app reducer + outbound send flow + tool catalog | 30 |
+| **Unit** | Discord crate: config parsing + target-channel planning + owner/text routing policy + runtime bootstrap + service helper behavior | 21 |
 | **Doc** | `lib.rs` usage example, `AudioEncoder` example | 4 |
 | **Bench** | Criterion hot-path suite (`cargo bench -p gemini-live`) | 1 |
 
-**Total: 45 library unit + 2 IO unit + 7 runtime unit + 30 CLI unit + 4 doc tests + 1 benchmark suite**
+**Total: 45 library unit + 2 IO unit + 7 runtime unit + 30 CLI unit + 21 Discord unit + 4 doc tests + 1 benchmark suite**
 
 ## Running Tests
 

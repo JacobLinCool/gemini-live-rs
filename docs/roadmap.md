@@ -57,6 +57,7 @@ Planned tests not yet implemented.
 | T-5 | E2E: multimodal streaming | Audio + video sent simultaneously; verify both are processed. | Low |
 | T-6 | Stress: reconnection stability | Unstable network simulation → verify no events are dropped across reconnections. | Low |
 | T-7 | CLI parser / reducer / tool-runtime tests | Slash parser/completion coverage, startup/render tests, tool-catalog tests, app-reducer tests, outbound send tests, and managed-runtime tests now exist. Expand coverage to staged-profile apply flow and richer local tool execution boundaries. | High |
+| T-8 | Discord host tests | The Discord crate now covers config parsing, routing policy, target-channel planning, runtime bootstrap, service helper behavior, and text-turn audio suppression rules. Add higher-level tests for guild setup execution against mocked Discord HTTP, runtime event projection, and Songbird bridge lifecycle. | High |
 
 ## Tech Debt
 

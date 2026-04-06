@@ -38,24 +38,24 @@ Tracked in [`roadmap.md`](roadmap.md) items **P-1** through **P-5**.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                    Host Application / UI                      │
+│              Host Applications (`cli` / `discord`)           │
 ├──────────────────────────────────────────────────────────────┤
-│  Desktop Media Adapters (`gemini-live-io`)                    │
-│  Mic capture · speaker playback · screen capture              │
+│  Desktop Media Adapters (`gemini-live-io`)                   │
+│  Mic capture · speaker playback · screen capture             │
 ├──────────────────────────────────────────────────────────────┤
-│  Runtime Layer (`gemini-live-runtime`)                        │
-│  Staged setup · driver boundary · reusable host contracts     │
+│  Runtime Layer (`gemini-live-runtime`)                       │
+│  Staged setup · driver boundary · reusable host contracts    │
 ├──────────────────────────────────────────────────────────────┤
-│  Session Layer (session.rs)                                   │
-│  Connection lifecycle · auto-reconnect · session resumption   │
+│  Session Layer (session.rs)                                  │
+│  Connection lifecycle · auto-reconnect · session resumption  │
 ├──────────────────────────────────────────────────────────────┤
-│  Codec Layer (codec.rs)                                       │
-│  ServerMessage ↔ ServerEvent decomposition · encode / decode  │
+│  Codec Layer (codec.rs)                                      │
+│  ServerMessage ↔ ServerEvent decomposition · encode / decode │
 ├──────────────────────────────────────────────────────────────┤
-│  Transport Layer (transport.rs)                               │
-│  WebSocket + rustls · frame I/O · no JSON awareness           │
+│  Transport Layer (transport.rs)                              │
+│  WebSocket + rustls · frame I/O · no JSON awareness          │
 ├──────────────────────────────────────────────────────────────┤
-│  Types (types/) + Audio (audio.rs) + Errors (error.rs)        │
+│  Types (types/) + Audio (audio.rs) + Errors (error.rs)       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -159,3 +159,19 @@ That crate is the natural home for:
 
 This keeps the CLI focused on TUI product behavior and lets future desktop
 hosts reuse the same media adapters without reaching into a binary crate.
+
+### ADR-10: Discord host behavior lives in `gemini-live-discord`
+
+The workspace now also has a dedicated `gemini-live-discord` crate for the
+Discord-specific host layer that pairs `serenity` and `songbird` with the
+shared Gemini runtime.
+
+That crate is the natural home for:
+
+- single-guild / single-owner routing policy
+- configured target voice-channel discovery and creation
+- Discord gateway intents and event handling
+- the Songbird voice receive / playback bridge
+
+This keeps Discord product logic out of the desktop CLI and avoids trying to
+force Discord voice handling through the desktop-only `gemini-live-io` crate.

@@ -1,0 +1,22 @@
+[package]
+name = "gemini-live-discord"
+version = "0.1.7"
+description = "Discord voice and text host for Gemini Live"
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gemini-live = { workspace = true }
+gemini-live-runtime = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serenity = { version = "0.12.5", default-features = false, features = ["builder", "cache", "client", "gateway", "http", "model", "rustls_backend", "utils"] }
+songbird = { version = "0.6.0", default-features = false, features = ["driver", "gateway", "receive", "rustls", "serenity", "tungstenite"] }
+# Songbird's RawAdapter path relies on Symphonia's PCM decoder being enabled.
+symphonia = { version = "0.5.5", default-features = false, features = ["pcm"] }
+
+[dev-dependencies]

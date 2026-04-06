@@ -140,7 +140,7 @@ Each layer's public API and design notes are documented in source code doc comme
 
 ## Workspace Crates
 
-This repository now has four focused crates instead of treating the CLI as the
+This repository now has five focused crates instead of treating the CLI as the
 accidental home for reusable host logic:
 
 | Crate | Role |
@@ -149,6 +149,7 @@ accidental home for reusable host logic:
 | `gemini-live-runtime` | Reusable staged-setup and managed runtime orchestration |
 | `gemini-live-io` | Reusable desktop mic / speaker / screen adapters |
 | `gemini-live-cli` | Interactive desktop TUI built on the three crates above |
+| `gemini-live-discord` | Single-guild Discord host for a shared text/voice Gemini Live agent |
 
 ## Audio Streaming
 

@@ -38,7 +38,13 @@ Tracked in [`roadmap.md`](roadmap.md) items **P-1** through **P-5**.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                     Application / CLI                         │
+│                    Host Application / UI                      │
+├──────────────────────────────────────────────────────────────┤
+│  Desktop Media Adapters (`gemini-live-io`)                    │
+│  Mic capture · speaker playback · screen capture              │
+├──────────────────────────────────────────────────────────────┤
+│  Runtime Layer (`gemini-live-runtime`)                        │
+│  Staged setup · driver boundary · reusable host contracts     │
 ├──────────────────────────────────────────────────────────────┤
 │  Session Layer (session.rs)                                   │
 │  Connection lifecycle · auto-reconnect · session resumption   │
@@ -85,7 +91,7 @@ Multiple async tasks often need to hold the same session simultaneously (one sen
 
 **Note:** the current `Session::send_audio` convenience method does **not** use `AudioEncoder` — it calls `STANDARD.encode()` which allocates a new `String` each time. Callers needing maximum performance should use `AudioEncoder` + `Session::send_raw` directly. This is a known gap (see [`roadmap.md`](roadmap.md) **P-1**).
 
-### ADR-6: CLI tool profile is staged, then applied via a fresh session
+### ADR-6: CLI setup changes are staged, then applied via explicit reconnect
 
 Live API tools are part of the immutable `setup` payload for an open
 connection. The CLI therefore separates:
@@ -93,16 +99,15 @@ connection. The CLI therefore separates:
 - **desired tool profile** — changed by `/tools enable|disable|toggle`
 - **active tool profile** — the profile on the currently connected session
 
-`/tools apply` promotes the staged profile by opening a fresh session with the
-new `setup.tools` payload. This keeps the command surface honest: toggling a
-tool does not pretend to mutate a connection that the protocol says is already
-configured.
+`/tools apply` and `/system apply` promote staged setup changes by reconnecting
+with a newly built `setup` payload. This keeps the command surface honest:
+toggling a tool does not pretend to mutate a connection that the protocol says
+is already configured.
 
-The first implementation deliberately chooses a fresh session over automatic
-session-resumption surgery. The public API reference says configuration changes
-are possible during pause/resume, but the crate does not yet expose a precise,
-caller-controlled resume flow. Until that exists, the CLI prefers a simple,
-explicit reconnect over a half-specified hidden transition.
+The current implementation uses explicit session resumption when a
+server-issued resumption handle is available, so conversation state can carry
+over across the reconnect. If the server has not published a handle yet, the
+apply fails explicitly instead of silently falling back to a fresh session.
 
 ### ADR-7: CLI user preferences live in a global named-profile store
 
@@ -123,3 +128,34 @@ can seed future launches.
 This design keeps startup deterministic and easy to explain: the active
 profile is the durable source of truth, while environment variables remain a
 simple override layer for automation or one-off launches.
+
+### ADR-8: Reusable host orchestration lives outside the CLI binary
+
+The workspace now has a dedicated `gemini-live-runtime` crate for the layer
+that sits above the base `gemini-live` session client and below concrete host
+applications such as the desktop CLI or a future voice bot.
+
+That crate is the natural home for:
+
+- staged-vs-active `setup` orchestration
+- a testable session-driver abstraction above `Session`
+- shared runtime event and tool-execution contracts
+- managed session forwarding and tool-call orchestration (`ManagedRuntime`)
+
+This avoids turning the CLI into the accidental source of truth for reusable
+application logic, and it avoids creating a vague "utils" crate with no
+clear architectural boundary.
+
+### ADR-9: Desktop media adapters live in `gemini-live-io`
+
+Desktop-specific mic, speaker, and screen-capture code now lives in a
+dedicated `gemini-live-io` crate instead of the CLI binary.
+
+That crate is the natural home for:
+
+- microphone capture and AEC-backed cleaned PCM output
+- speaker playback and AEC render-reference feeding
+- screen-target enumeration and JPEG frame capture
+
+This keeps the CLI focused on TUI product behavior and lets future desktop
+hosts reuse the same media adapters without reaching into a binary crate.

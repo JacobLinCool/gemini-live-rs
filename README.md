@@ -138,6 +138,18 @@ Session  →  Transport  →  Codec  →  Types / Audio / Errors
 
 Each layer's public API and design notes are documented in source code doc comments — start from `lib.rs` and drill into modules.
 
+## Workspace Crates
+
+This repository now has four focused crates instead of treating the CLI as the
+accidental home for reusable host logic:
+
+| Crate | Role |
+|-------|------|
+| `gemini-live` | Wire-level Live API client |
+| `gemini-live-runtime` | Reusable staged-setup and managed runtime orchestration |
+| `gemini-live-io` | Reusable desktop mic / speaker / screen adapters |
+| `gemini-live-cli` | Interactive desktop TUI built on the three crates above |
+
 ## Audio Streaming
 
 For convenience:
@@ -251,6 +263,13 @@ cargo run -p gemini-live-cli --features vertex-auth
 | `/share-screen list` | List available capture targets |
 | `/share-screen <id> [interval]` | Start sharing a monitor or window |
 | `/share-screen` | Stop screen sharing |
+| `/system ...` | Stage / inspect / apply the system instruction |
+| `/tools ...` | Stage / inspect / apply the Live tool profile |
+
+The CLI also supports persistent named profiles via `--profile <name>` and a
+`gemini-live config` subcommand that prints the resolved config-file path. See
+[`docs/cli.md`](docs/cli.md) for the full command surface and current feature
+flags.
 
 ### Self-update
 

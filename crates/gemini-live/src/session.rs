@@ -54,6 +54,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// `setup` is sent on the initial connect and again on every reconnect. When a
 /// fresh resume handle exists, the session layer injects it into
 /// `setup.session_resumption.handle` before sending.
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub transport: TransportConfig,
     pub setup: SetupConfig,
@@ -66,6 +67,7 @@ pub struct SessionConfig {
 ///
 /// Outbound messages continue to queue in the command channel while reconnect
 /// attempts are in progress.
+#[derive(Debug, Clone)]
 pub struct ReconnectPolicy {
     /// Enable automatic reconnection.  Default: `true`.
     pub enabled: bool,
@@ -95,6 +97,17 @@ pub enum SessionStatus {
     Connected = 1,
     Reconnecting = 2,
     Closed = 3,
+}
+
+/// Observable items from the session receive cursor.
+///
+/// Most callers only care about [`ServerEvent`] values and can continue using
+/// [`Session::next_event`]. Callers that need visibility into dropped events
+/// should use [`Session::next_observed_event`].
+#[derive(Debug, Clone)]
+pub enum SessionObservation {
+    Event(ServerEvent),
+    Lagged { count: u64 },
 }
 
 // ── Session handle ───────────────────────────────────────────────────────────
@@ -309,14 +322,27 @@ impl Session {
     /// Returns `None` when the session is permanently closed.
     pub async fn next_event(&mut self) -> Option<ServerEvent> {
         loop {
-            match self.event_rx.recv().await {
-                Ok(event) => return Some(event),
-                Err(broadcast::error::RecvError::Lagged(n)) => {
+            match self.next_observed_event().await? {
+                SessionObservation::Event(event) => return Some(event),
+                SessionObservation::Lagged { count: n } => {
                     tracing::warn!(n, "event consumer lagged, some events were missed");
-                    continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
+        }
+    }
+
+    /// Wait for the next observable item on this handle's cursor.
+    ///
+    /// Unlike [`Session::next_event`], this does not hide lagged broadcast
+    /// notifications. Callers can therefore surface lost-event state directly
+    /// in their own runtime or UI layer.
+    pub async fn next_observed_event(&mut self) -> Option<SessionObservation> {
+        match self.event_rx.recv().await {
+            Ok(event) => Some(SessionObservation::Event(event)),
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                Some(SessionObservation::Lagged { count: n })
+            }
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     }
 

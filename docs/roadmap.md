@@ -42,10 +42,7 @@ end-user application.
 | ID | Item | Description | Priority |
 |----|------|-------------|----------|
 | C-1 | Richer session profiles | Persistent named profiles now cover backend, model, system instruction, credentials, tools, and device auto-start state. Extend them to first-class voice and richer session-template controls. | High |
-| C-2 | Tool-profile resumption and context carryover | The CLI now executes local function calls and can enable Google Search, but `/tools apply` still uses a fresh session. Add an explicit resume / carryover path so tool-profile changes do not drop server-side conversation state. | High |
-| C-3 | Runtime observability | Surface reconnecting, closed, lagged, and send-failure states in the TUI instead of swallowing `.ok()` results. | High |
 | C-4 | Distribution truthfulness | `update.rs` advertises Linux ARM64, but the release workflow does not ship that artifact. Align updater targets with published binaries. | Medium |
-| C-5 | Extract testable CLI boundaries | Split command parsing, event reduction, and render-state transitions out of `main.rs` so the CLI can gain unit and snapshot coverage. | High |
 
 ## Testing
 
@@ -59,7 +56,7 @@ Planned tests not yet implemented.
 | T-4 | Integration: GoAway reconnect | Session: simulate or trigger `GoAway` → verify auto-reconnect with resume handle. | Medium |
 | T-5 | E2E: multimodal streaming | Audio + video sent simultaneously; verify both are processed. | Low |
 | T-6 | Stress: reconnection stability | Unstable network simulation → verify no events are dropped across reconnections. | Low |
-| T-7 | CLI parser / reducer / tool-runtime tests | Basic slash parser/completion coverage plus tool-catalog tests now exist. Expand coverage to server-event handling, staged-profile apply flow, media input edge cases, and local tool execution boundaries. | High |
+| T-7 | CLI parser / reducer / tool-runtime tests | Slash parser/completion coverage, startup/render tests, tool-catalog tests, app-reducer tests, outbound send tests, and managed-runtime tests now exist. Expand coverage to staged-profile apply flow and richer local tool execution boundaries. | High |
 
 ## Tech Debt
 

@@ -6,17 +6,24 @@
 //! - how local function calls are validated and executed
 //!
 //! Tool availability is part of the Live API session setup, so changes are
-//! staged first and only take effect after `/tools apply` creates a fresh
-//! session with the new setup payload.
+//! staged first and only take effect after `/tools apply` reconnects with the
+//! new setup payload. When the server has already issued a resumption handle,
+//! the reconnect carries conversation state across that apply.
+//!
+//! `ToolRuntime` also implements the shared `gemini_live_runtime::ToolAdapter`
+//! contract so host-specific tool catalogs can be reused outside the desktop
+//! CLI.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use gemini_live::types::{
     FunctionCallRequest, FunctionDeclaration, FunctionResponse, GoogleSearchTool, Tool,
 };
+use gemini_live_runtime::{ToolAdapter, ToolDescriptor, ToolKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -431,6 +438,33 @@ impl ToolRuntime {
             Ok(relative) => relative.display().to_string(),
             Err(_) => path.display().to_string(),
         }
+    }
+}
+
+impl ToolAdapter for ToolRuntime {
+    fn advertised_tools(&self) -> Option<Vec<Tool>> {
+        self.profile.build_live_tools()
+    }
+
+    fn descriptors(&self) -> Vec<ToolDescriptor> {
+        ToolId::ALL
+            .into_iter()
+            .map(|tool| ToolDescriptor {
+                key: tool.key().to_string(),
+                summary: tool.summary().to_string(),
+                kind: match tool {
+                    ToolId::GoogleSearch => ToolKind::BuiltIn,
+                    ToolId::ListFiles | ToolId::ReadFile | ToolId::RunCommand => ToolKind::Local,
+                },
+            })
+            .collect()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: FunctionCallRequest,
+    ) -> BoxFuture<'a, Result<FunctionResponse, gemini_live_runtime::ToolExecutionError>> {
+        Box::pin(async move { Ok(self.execute_call(call).await) })
     }
 }
 

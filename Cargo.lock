@@ -1279,12 +1279,12 @@ name = "gemini-live-cli"
 version = "0.1.6"
 dependencies = [
  "clap",
- "cpal",
  "crossterm",
  "futures-util",
  "gemini-live",
+ "gemini-live-io",
+ "gemini-live-runtime",
  "hound",
- "image",
  "ratatui",
  "reqwest",
  "serde",
@@ -1295,8 +1295,31 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-textarea",
+]
+
+[[package]]
+name = "gemini-live-io"
+version = "0.1.6"
+dependencies = [
+ "cpal",
+ "image",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "webrtc-audio-processing",
  "xcap",
+]
+
+[[package]]
+name = "gemini-live-runtime"
+version = "0.1.6"
+dependencies = [
+ "base64",
+ "futures-util",
+ "gemini-live",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

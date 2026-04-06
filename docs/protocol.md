@@ -14,11 +14,11 @@
 | Resource | URL |
 |---|---|
 | **WebSockets API reference (primary)** | https://ai.google.dev/api/live |
-| **Raw WebSocket quickstart** | https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket |
-| **Capabilities guide** | https://ai.google.dev/gemini-api/docs/live-api/capabilities |
-| **Tool use guide** | https://ai.google.dev/gemini-api/docs/live-api/tools |
-| **Session management** | https://ai.google.dev/gemini-api/docs/live-api/session-management |
-| **Ephemeral tokens** | https://ai.google.dev/gemini-api/docs/live-api/ephemeral-tokens |
+| **Live API guide / quickstart** | https://ai.google.dev/api/multimodal-live |
+| **Capabilities guide** | https://ai.google.dev/gemini-api/docs/live-guide |
+| **Tool use guide** | https://ai.google.dev/gemini-api/docs/live-tools |
+| **Session management** | https://ai.google.dev/gemini-api/docs/live-session |
+| **Ephemeral tokens** | https://ai.google.dev/gemini-api/docs/ephemeral-tokens |
 | **Deprecations / model lifecycle** | https://ai.google.dev/gemini-api/docs/deprecations |
 | **Vertex AI Live API overview** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api |
 | **Vertex AI Live session management** | https://docs.cloud.google.com/vertex-ai/generative-ai/docs/live-api/start-manage-session |
@@ -43,19 +43,20 @@ Authorization: Bearer {TOKEN}
 
 ---
 
-## Current Gemini API Live Models
+## Model Lifecycle Notes
 
-The public Gemini API deprecations page currently lists these Live models:
+Do not maintain an exhaustive public Live-model inventory in this file.
+Preview model names and shutdown dates have changed repeatedly across
+2025-2026, and those facts drift faster than repository code.
 
-| Model | Release date | Lifecycle note |
-|---|---|---|
-| `gemini-3.1-flash-live-preview` | 2026-03-11 | Current preview baseline |
-| `gemini-2.5-flash-native-audio-preview-12-2025` | 2025-12-12 | Current preview model |
-| `gemini-live-2.5-flash-preview` | 2025-06-17 | Deprecated; shutdown date 2025-12-09 |
-| `gemini-2.0-flash-live-001` | 2025-04-09 | Deprecated; shutdown date 2025-12-09 |
+Use these sources instead:
 
-When choosing defaults, prefer a model that still appears on the
-deprecations page with no shutdown date announced.
+- current Gemini API Live guides for models that are actively documented
+- the deprecations page for announced shutdown dates
+- `crates/gemini-live-cli/src/startup.rs` for the workspace's current CLI default
+
+Treat any hard-coded default model as a product choice, not as the canonical
+upstream model list.
 
 ---
 

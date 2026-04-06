@@ -1,0 +1,24 @@
+[package]
+name = "gemini-live-io"
+version = "0.1.6"
+description = "Desktop media adapters for Gemini Live hosts"
+readme = "../../README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+aec = ["dep:webrtc-audio-processing"]
+mic = ["dep:cpal", "aec"]
+speaker = ["dep:cpal", "aec"]
+screen = ["dep:xcap", "dep:image"]
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+cpal = { version = "0.15", optional = true }
+webrtc-audio-processing = { version = "2.0", features = ["bundled"], optional = true }
+xcap = { version = "0.9", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }

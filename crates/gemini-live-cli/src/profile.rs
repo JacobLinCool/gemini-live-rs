@@ -154,6 +154,7 @@ impl ProfileStore {
         self.save()
     }
 
+    #[cfg(any(feature = "mic", feature = "speak"))]
     pub fn set_audio_state(&mut self, mic_enabled: bool, speak_enabled: bool) -> io::Result<()> {
         let profile = self.active_profile_mut();
         profile.mic_enabled = Some(mic_enabled);
@@ -161,6 +162,7 @@ impl ProfileStore {
         self.save()
     }
 
+    #[cfg(feature = "share-screen")]
     pub fn set_screen_share(
         &mut self,
         enabled: bool,

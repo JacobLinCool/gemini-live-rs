@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live"
-version = "0.1.6"
+version = "0.1.7"
 description = "High-performance Rust client for the Gemini Multimodal Live API"
 readme = "../../README.md"
 edition.workspace = true

@@ -2,7 +2,7 @@
 //!
 //! This module owns the single-guild host runtime:
 //!
-//! - connect one shared Gemini Live session
+//! - lazily wake one shared Gemini Live session when text or voice needs it
 //! - create or reuse the configured Discord voice channel
 //! - receive text messages from that channel's chat surface
 //! - auto-join voice when the configured owner enters the channel
@@ -11,11 +11,13 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gemini_live::ServerEvent;
+use gemini_live::types::{Content, Part};
 use gemini_live_runtime::{
-    GeminiSessionHandle, RuntimeEvent, RuntimeEventReceiver, RuntimeLifecycleEvent,
-    RuntimeSendFailure, RuntimeSession,
+    ActivityKind, RuntimeEvent, RuntimeEventReceiver, RuntimeLifecycleEvent, RuntimeSendFailure,
+    SessionLifecycleState, WakeReason,
 };
 use serenity::Client;
 use serenity::all::{
@@ -34,7 +36,7 @@ use crate::config::DiscordBotConfig;
 use crate::error::DiscordServiceError;
 use crate::gateway::gateway_intents;
 use crate::policy::BotConversationScope;
-use crate::session::{DiscordManagedRuntime, new_managed_runtime};
+use crate::session::{DiscordSessionManager, new_session_manager};
 use crate::setup::ensure_target_voice_channel;
 use crate::voice::{ActiveVoiceBridge, VoiceBridge, VoiceSessionPlan};
 
@@ -62,10 +64,10 @@ impl DiscordAgentService {
     }
 
     pub fn prepare(&self) -> PreparedDiscordService {
-        let (runtime, runtime_events) = new_managed_runtime(&self.config);
+        let (session_manager, runtime_events) = new_session_manager(&self.config);
         PreparedDiscordService {
             config: self.config.clone(),
-            runtime,
+            session_manager,
             runtime_events,
             state: DiscordServiceState::default(),
         }
@@ -75,7 +77,7 @@ impl DiscordAgentService {
 /// Prepared service instance with a configured Gemini Live runtime.
 pub struct PreparedDiscordService {
     config: DiscordBotConfig,
-    runtime: DiscordManagedRuntime,
+    session_manager: DiscordSessionManager,
     runtime_events: RuntimeEventReceiver,
     state: DiscordServiceState,
 }
@@ -87,19 +89,29 @@ struct SharedBotState {
 
 struct SharedBotStateInner {
     config: DiscordBotConfig,
-    session: GeminiSessionHandle,
+    session_manager: Mutex<DiscordSessionManager>,
     service_state: RwLock<DiscordServiceState>,
     pending_text_replies: Mutex<VecDeque<PendingTextReply>>,
     voice_bridge: Mutex<Option<ActiveVoiceBridge>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTextReply {
     channel_id: ChannelId,
+    prompt: String,
 }
 
 struct RuntimeReplyState {
     active: Option<ChatReplyAccumulator>,
+}
+
+struct CompletedTurn {
+    channel_id: ChannelId,
+    rendered_text: String,
+    user_turn: Option<Content>,
+    model_turn: Option<Content>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +124,7 @@ enum ReplyOrigin {
 struct ChatReplyAccumulator {
     origin: ReplyOrigin,
     channel_id: ChannelId,
+    user_input: String,
     output_transcription: String,
     model_text: String,
 }
@@ -134,21 +147,16 @@ impl PreparedDiscordService {
         &mut self.state
     }
 
-    pub fn runtime(&mut self) -> &mut DiscordManagedRuntime {
-        &mut self.runtime
+    pub fn session_manager(&mut self) -> &mut DiscordSessionManager {
+        &mut self.session_manager
     }
 
     pub fn runtime_events(&mut self) -> &mut RuntimeEventReceiver {
         &mut self.runtime_events
     }
 
-    pub async fn run(mut self) -> Result<(), DiscordServiceError> {
-        self.runtime.connect().await?;
-        let session = self
-            .runtime
-            .active_session()
-            .expect("connected runtime must expose an active session");
-        let shared_state = SharedBotState::new(self.config.clone(), session);
+    pub async fn run(self) -> Result<(), DiscordServiceError> {
+        let shared_state = SharedBotState::new(self.config.clone(), self.session_manager);
         let handler = DiscordGatewayHandler {
             state: shared_state.clone(),
         };
@@ -164,10 +172,13 @@ impl PreparedDiscordService {
             tracing::warn!("initial Discord setup failed: {error}");
         }
 
-        let runtime_task = spawn_runtime_event_loop(shared_state, self.runtime_events, http);
+        let runtime_task =
+            spawn_runtime_event_loop(shared_state.clone(), self.runtime_events, http);
+        let idle_task = spawn_idle_dormancy_loop(shared_state.clone());
         let start_result = client.start().await;
         runtime_task.abort();
-        let close_result = self.runtime.close().await;
+        idle_task.abort();
+        let close_result = shared_state.close_runtime().await;
 
         start_result?;
         close_result?;
@@ -176,11 +187,11 @@ impl PreparedDiscordService {
 }
 
 impl SharedBotState {
-    fn new(config: DiscordBotConfig, session: GeminiSessionHandle) -> Self {
+    fn new(config: DiscordBotConfig, session_manager: DiscordSessionManager) -> Self {
         Self {
             inner: Arc::new(SharedBotStateInner {
                 config,
-                session,
+                session_manager: Mutex::new(session_manager),
                 service_state: RwLock::new(DiscordServiceState::default()),
                 pending_text_replies: Mutex::new(VecDeque::new()),
                 voice_bridge: Mutex::new(None),
@@ -244,16 +255,20 @@ impl SharedBotState {
         &self,
         message: &Message,
     ) -> Result<(), DiscordServiceError> {
+        let prompt = format_user_message_for_model(message);
         self.inner
             .pending_text_replies
             .lock()
             .await
             .push_back(PendingTextReply {
                 channel_id: message.channel_id,
+                prompt: prompt.clone(),
             });
-
-        let prompt = format_user_message_for_model(message);
-        if let Err(error) = self.inner.session.send_text(&prompt).await {
+        let mut session_manager = self.inner.session_manager.lock().await;
+        session_manager
+            .ensure_hot(WakeReason::TextInput, Instant::now())
+            .await?;
+        if let Err(error) = session_manager.runtime().send_text(&prompt).await {
             let _ = self.inner.pending_text_replies.lock().await.pop_back();
             return Err(DiscordServiceError::from(error));
         }
@@ -281,6 +296,17 @@ impl SharedBotState {
             existing.shutdown().await?;
         }
 
+        let session = {
+            let mut session_manager = self.inner.session_manager.lock().await;
+            session_manager
+                .ensure_hot(WakeReason::VoiceJoin, Instant::now())
+                .await?;
+            session_manager
+                .active_session()
+                .ok_or(DiscordServiceError::from(
+                    gemini_live_runtime::RuntimeError::NotConnected,
+                ))?
+        };
         let manager = get_songbird(ctx)
             .await
             .ok_or(DiscordServiceError::SongbirdUnavailable)?;
@@ -292,7 +318,7 @@ impl SharedBotState {
                 owner_user_id: self.inner.config.owner_user_id,
             },
         )
-        .attach(self.inner.session.clone())
+        .attach(session)
         .await?;
         *bridge_slot = Some(bridge);
 
@@ -326,11 +352,61 @@ impl SharedBotState {
             bridge.clear_model_audio();
         }
     }
+
+    async fn close_runtime(&self) -> Result<(), DiscordServiceError> {
+        self.leave_voice().await?;
+        let mut session_manager = self.inner.session_manager.lock().await;
+        session_manager.enter_dormant().await?;
+        Ok(())
+    }
+
+    async fn sync_resume_handle_from_runtime(&self, issued_at: Instant) {
+        let session_manager = self.inner.session_manager.lock().await;
+        session_manager.sync_resume_handle_from_runtime(issued_at);
+    }
+
+    async fn record_runtime_activity(&self, kind: ActivityKind, at: Instant) {
+        let session_manager = self.inner.session_manager.lock().await;
+        session_manager.record_activity(kind, at);
+    }
+
+    async fn record_completed_turn(&self, turn: &CompletedTurn) {
+        let session_manager = self.inner.session_manager.lock().await;
+        if let Some(user_turn) = turn.user_turn.clone() {
+            session_manager.record_recent_turn(user_turn);
+        }
+        if let Some(model_turn) = turn.model_turn.clone() {
+            session_manager.record_recent_turn(model_turn);
+        }
+    }
+
+    async fn maybe_enter_dormant_if_idle(&self, now: Instant) -> Result<(), DiscordServiceError> {
+        if self.inner.voice_bridge.lock().await.is_some() {
+            return Ok(());
+        }
+
+        let mut session_manager = self.inner.session_manager.lock().await;
+        if session_manager.lifecycle_state() == SessionLifecycleState::Dormant {
+            return Ok(());
+        }
+        if session_manager.idle_decision(now) == gemini_live_runtime::IdleDecision::EnterDormant {
+            session_manager.enter_dormant().await?;
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeReplyState {
     fn new() -> Self {
         Self { active: None }
+    }
+
+    fn append_input_transcription(&mut self, text: &str) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("reply target must be established before input transcription append");
+        active.user_input.push_str(text);
     }
 
     fn append_output_transcription(&mut self, text: &str) {
@@ -349,23 +425,21 @@ impl RuntimeReplyState {
         active.model_text.push_str(text);
     }
 
-    fn finish_turn(&mut self) -> Option<(ChannelId, String)> {
-        let active = self.active.take()?;
-        let channel_id = active.channel_id;
-        let rendered = active.rendered_text();
-        if rendered.is_empty() {
-            None
-        } else {
-            Some((channel_id, rendered))
-        }
+    fn discard_active(&mut self) {
+        self.active = None;
+    }
+
+    fn finish_turn(&mut self) -> Option<CompletedTurn> {
+        self.active.take().map(ChatReplyAccumulator::finish_turn)
     }
 }
 
 impl ChatReplyAccumulator {
-    fn for_text_turn(channel_id: ChannelId) -> Self {
+    fn for_text_turn(channel_id: ChannelId, prompt: String) -> Self {
         Self {
             origin: ReplyOrigin::TextTurn,
             channel_id,
+            user_input: prompt,
             output_transcription: String::new(),
             model_text: String::new(),
         }
@@ -375,12 +449,23 @@ impl ChatReplyAccumulator {
         Self {
             origin: ReplyOrigin::VoiceTurn,
             channel_id,
+            user_input: String::new(),
             output_transcription: String::new(),
             model_text: String::new(),
         }
     }
 
-    fn rendered_text(self) -> String {
+    fn finish_turn(self) -> CompletedTurn {
+        let rendered_text = self.rendered_text();
+        CompletedTurn {
+            channel_id: self.channel_id,
+            rendered_text: rendered_text.clone(),
+            user_turn: content_from_turn_text("user", self.user_input),
+            model_turn: content_from_turn_text("model", rendered_text),
+        }
+    }
+
+    fn rendered_text(&self) -> String {
         let output = self.output_transcription.trim();
         if !output.is_empty() {
             output.to_owned()
@@ -540,34 +625,52 @@ async fn handle_server_event(
             }
         }
         ServerEvent::OutputTranscription(text) => {
+            state
+                .record_runtime_activity(ActivityKind::ModelOutput, Instant::now())
+                .await;
             tracing::info!("Gemini output transcription: {text}");
             if ensure_active_reply(state, reply_state).await.is_some() {
                 reply_state.append_output_transcription(&text);
             }
         }
         ServerEvent::ModelText(text) => {
+            state
+                .record_runtime_activity(ActivityKind::ModelOutput, Instant::now())
+                .await;
             if ensure_active_reply(state, reply_state).await.is_some() {
                 reply_state.append_model_text(&text);
             }
         }
         ServerEvent::TurnComplete => {
             let _ = ensure_active_reply(state, reply_state).await;
-            if let Some((channel_id, text)) = reply_state.finish_turn() {
-                send_discord_text(http, channel_id, &text).await?;
+            if let Some(turn) = reply_state.finish_turn() {
+                if !turn.rendered_text.is_empty() {
+                    send_discord_text(http, turn.channel_id, &turn.rendered_text).await?;
+                }
+                state.record_completed_turn(&turn).await;
             }
         }
         ServerEvent::Interrupted => {
             state.clear_model_audio().await;
+            reply_state.discard_active();
             tracing::debug!("Gemini Live turn was interrupted");
         }
         ServerEvent::InputTranscription(text) => {
+            state
+                .record_runtime_activity(ActivityKind::VoiceInput, Instant::now())
+                .await;
             tracing::info!("Gemini input transcription: {text}");
+            if ensure_active_reply(state, reply_state).await.is_some() {
+                reply_state.append_input_transcription(&text);
+            }
         }
         ServerEvent::GenerationComplete => {}
         ServerEvent::SetupComplete => {}
         ServerEvent::ToolCall(_) => {}
         ServerEvent::ToolCallCancellation(_) => {}
-        ServerEvent::SessionResumption { .. } => {}
+        ServerEvent::SessionResumption { .. } => {
+            state.sync_resume_handle_from_runtime(Instant::now()).await;
+        }
         ServerEvent::GoAway { time_left } => {
             tracing::warn!("Gemini Live requested reconnect; time left: {time_left:?}");
         }
@@ -594,15 +697,34 @@ async fn ensure_active_reply(
     if reply_state.active.is_some() {
         return reply_state.active.as_ref().map(|active| PendingTextReply {
             channel_id: active.channel_id,
+            prompt: active.user_input.clone(),
         });
     }
     if let Some(pending) = state.next_pending_text_reply().await {
-        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(pending.channel_id));
+        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
+            pending.channel_id,
+            pending.prompt.clone(),
+        ));
         return Some(pending);
     }
     let channel_id = state.target_channel_id().await?;
     reply_state.active = Some(ChatReplyAccumulator::for_voice_turn(channel_id));
-    Some(PendingTextReply { channel_id })
+    Some(PendingTextReply {
+        channel_id,
+        prompt: String::new(),
+    })
+}
+
+fn spawn_idle_dormancy_loop(state: SharedBotState) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(error) = state.maybe_enter_dormant_if_idle(Instant::now()).await {
+                tracing::warn!("idle dormancy evaluation failed: {error}");
+            }
+        }
+    })
 }
 
 fn log_runtime_lifecycle(event: &RuntimeLifecycleEvent) {
@@ -615,6 +737,9 @@ fn log_runtime_lifecycle(event: &RuntimeLifecycleEvent) {
         }
         RuntimeLifecycleEvent::AppliedFreshSession => {
             tracing::warn!("Gemini Live switched to a fresh session")
+        }
+        RuntimeLifecycleEvent::Closed { reason } if reason.is_empty() => {
+            tracing::info!("Gemini Live session closed")
         }
         RuntimeLifecycleEvent::Closed { reason } => {
             tracing::warn!("Gemini Live session closed: {reason}")
@@ -679,6 +804,20 @@ fn format_user_message_for_model_parts(author_name: &str, content: &str) -> Stri
     format!("Discord user {author_name} says: {content}")
 }
 
+fn content_from_turn_text(role: &str, text: String) -> Option<Content> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(Content {
+        role: Some(role.to_owned()),
+        parts: vec![Part {
+            text: Some(trimmed.to_owned()),
+            inline_data: None,
+        }],
+    })
+}
+
 async fn send_discord_text(
     http: &Arc<Http>,
     channel_id: ChannelId,
@@ -724,6 +863,8 @@ mod tests {
             owner_user_id: UserId::new(456),
             voice_channel_name: "gemini-live".into(),
             model: "models/custom-live".into(),
+            idle_timeout: Duration::from_secs(90),
+            max_recent_turns: 24,
         }
     }
 
@@ -756,24 +897,40 @@ mod tests {
     #[test]
     fn text_turns_still_render_text_projection() {
         let mut reply_state = RuntimeReplyState::new();
-        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(ChannelId::new(10)));
+        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
+            ChannelId::new(10),
+            "Discord user alice says: hello".into(),
+        ));
         reply_state.append_output_transcription("spoken text turn");
 
+        let completed = reply_state.finish_turn().expect("completed turn");
+        assert_eq!(completed.channel_id, ChannelId::new(10));
+        assert_eq!(completed.rendered_text, "spoken text turn");
         assert_eq!(
-            reply_state.finish_turn(),
-            Some((ChannelId::new(10), "spoken text turn".to_owned()))
+            completed.user_turn,
+            content_from_turn_text("user", "Discord user alice says: hello".into())
+        );
+        assert_eq!(
+            completed.model_turn,
+            content_from_turn_text("model", "spoken text turn".into())
         );
     }
 
     #[test]
     fn text_turn_reply_falls_back_to_model_text() {
         let mut reply_state = RuntimeReplyState::new();
-        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(ChannelId::new(10)));
+        reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
+            ChannelId::new(10),
+            "Discord user alice says: hello".into(),
+        ));
         reply_state.append_model_text("hello from text");
 
+        let completed = reply_state.finish_turn().expect("completed turn");
+        assert_eq!(completed.channel_id, ChannelId::new(10));
+        assert_eq!(completed.rendered_text, "hello from text");
         assert_eq!(
-            reply_state.finish_turn(),
-            Some((ChannelId::new(10), "hello from text".to_owned()))
+            completed.model_turn,
+            content_from_turn_text("model", "hello from text".into())
         );
     }
 
@@ -781,12 +938,20 @@ mod tests {
     fn voice_turn_reply_only_projects_output_transcription() {
         let mut reply_state = RuntimeReplyState::new();
         reply_state.active = Some(ChatReplyAccumulator::for_voice_turn(ChannelId::new(10)));
+        reply_state.append_input_transcription("hello from voice");
         reply_state.append_model_text("internal-only");
 
         reply_state.append_output_transcription("spoken reply");
+        let completed = reply_state.finish_turn().expect("completed turn");
+        assert_eq!(completed.channel_id, ChannelId::new(10));
+        assert_eq!(completed.rendered_text, "spoken reply");
         assert_eq!(
-            reply_state.finish_turn(),
-            Some((ChannelId::new(10), "spoken reply".to_owned()))
+            completed.user_turn,
+            content_from_turn_text("user", "hello from voice".into())
+        );
+        assert_eq!(
+            completed.model_turn,
+            content_from_turn_text("model", "spoken reply".into())
         );
     }
 

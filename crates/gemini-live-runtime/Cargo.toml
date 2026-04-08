@@ -2,7 +2,7 @@
 name = "gemini-live-runtime"
 version = "0.1.7"
 description = "Reusable runtime orchestration for Gemini Live applications"
-readme = "../../README.md"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

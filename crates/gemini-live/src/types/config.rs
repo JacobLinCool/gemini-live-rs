@@ -200,6 +200,11 @@ pub struct SessionResumptionConfig {
 /// Server-side context compression.  When the context grows past
 /// `trigger_tokens`, the server compresses it down to
 /// `sliding_window.target_tokens`.
+///
+/// This is not a presence-activated empty object. The Live API expects a
+/// compression mechanism to be selected, so callers should normally send at
+/// least `sliding_window: Some(SlidingWindow::default())`, which serializes as
+/// `{"slidingWindow": {}}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextWindowCompressionConfig {

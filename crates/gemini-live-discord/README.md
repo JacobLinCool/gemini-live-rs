@@ -56,6 +56,8 @@ Session:
 - Text and voice share one Live session context.
 - Leaving the voice channel should tear down the Discord voice bridge, not
   necessarily discard the Live session state used by text chat.
+- The Live session may go dormant after idle time and later wake by resuming
+  the last good handle or by rehydrating from process-local recent turns.
 
 ## Environment
 
@@ -71,6 +73,10 @@ Optional:
 
 - `GEMINI_MODEL`
   - Defaults to `models/gemini-3.1-flash-live-preview`
+- `DISCORD_SESSION_IDLE_TIMEOUT_SECS`
+  - Defaults to `600`
+- `DISCORD_SESSION_MAX_RECENT_TURNS`
+  - Defaults to `16`
 
 ## Running
 
@@ -98,9 +104,11 @@ The crate now includes:
 - environment parsing and validation
 - a shared audio-first Gemini Live session bootstrap
 - a built-in system instruction that grounds the model in Discord voice/chat
+- server-side context compression and initial-history support for fresh wakes
 - Discord gateway handling through `serenity`
 - target voice-channel discovery or creation through Discord HTTP
 - an owner-only Songbird receive/playback bridge
+- a lazy hot/dormant session manager with in-memory recent-turn continuity
 
 What is still intentionally narrow:
 

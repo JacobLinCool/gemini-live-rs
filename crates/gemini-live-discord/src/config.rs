@@ -5,13 +5,18 @@
 //! - which environment variables are required
 //! - which values are optional
 //! - how Discord ids are validated
+//! - how dormant-session policy is tuned
 //! - what default Gemini model is used when the caller does not override it
+
+use std::time::Duration;
 
 use serenity::all::{GuildId, UserId};
 
 use crate::error::ConfigError;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "models/gemini-3.1-flash-live-preview";
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 10 * 60;
+pub const DEFAULT_MAX_RECENT_TURNS: usize = 16;
 
 /// Startup configuration for the single-guild Discord bot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +27,8 @@ pub struct DiscordBotConfig {
     pub owner_user_id: UserId,
     pub voice_channel_name: String,
     pub model: String,
+    pub idle_timeout: Duration,
+    pub max_recent_turns: usize,
 }
 
 impl DiscordBotConfig {
@@ -54,6 +61,16 @@ impl DiscordBotConfig {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+        let idle_timeout = Duration::from_secs(optional_positive_u64(
+            &mut read_env,
+            "DISCORD_SESSION_IDLE_TIMEOUT_SECS",
+            DEFAULT_IDLE_TIMEOUT_SECS,
+        )?);
+        let max_recent_turns = optional_positive_usize(
+            &mut read_env,
+            "DISCORD_SESSION_MAX_RECENT_TURNS",
+            DEFAULT_MAX_RECENT_TURNS,
+        )?;
 
         Ok(Self {
             discord_bot_token,
@@ -62,6 +79,8 @@ impl DiscordBotConfig {
             owner_user_id,
             voice_channel_name,
             model,
+            idle_timeout,
+            max_recent_turns,
         })
     }
 }
@@ -100,6 +119,56 @@ fn parse_discord_id<T>(
     Ok(ctor(parsed))
 }
 
+fn optional_positive_u64(
+    read_env: &mut impl FnMut(&str) -> Option<String>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    match read_env(key) {
+        Some(raw) => parse_positive_u64(raw, key),
+        None => Ok(default),
+    }
+}
+
+fn optional_positive_usize(
+    read_env: &mut impl FnMut(&str) -> Option<String>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match read_env(key) {
+        Some(raw) => parse_positive_usize(raw, key),
+        None => Ok(default),
+    }
+}
+
+fn parse_positive_u64(raw: String, key: &'static str) -> Result<u64, ConfigError> {
+    let parsed = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidPositiveInt {
+            key,
+            value: raw.clone(),
+        })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidPositiveInt { key, value: raw });
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_usize(raw: String, key: &'static str) -> Result<usize, ConfigError> {
+    let parsed = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ConfigError::InvalidPositiveInt {
+            key,
+            value: raw.clone(),
+        })?;
+    if parsed == 0 {
+        return Err(ConfigError::InvalidPositiveInt { key, value: raw });
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -131,6 +200,11 @@ mod tests {
         assert_eq!(config.owner_user_id, UserId::new(456));
         assert_eq!(config.voice_channel_name, "gemini-live");
         assert_eq!(config.model, DEFAULT_GEMINI_MODEL);
+        assert_eq!(
+            config.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(config.max_recent_turns, DEFAULT_MAX_RECENT_TURNS);
     }
 
     #[test]
@@ -184,5 +258,43 @@ mod tests {
         .expect("config should resolve");
 
         assert_eq!(config.model, "models/custom-live");
+    }
+
+    #[test]
+    fn resolves_optional_session_policy_overrides() {
+        let config = resolve(&[
+            ("DISCORD_BOT_TOKEN", "discord-token"),
+            ("GEMINI_API_KEY", "gemini-key"),
+            ("DISCORD_GUILD_ID", "123"),
+            ("DISCORD_OWNER_USER_ID", "456"),
+            ("DISCORD_VOICE_CHANNEL_NAME", "gemini-live"),
+            ("DISCORD_SESSION_IDLE_TIMEOUT_SECS", "90"),
+            ("DISCORD_SESSION_MAX_RECENT_TURNS", "24"),
+        ])
+        .expect("config should resolve");
+
+        assert_eq!(config.idle_timeout, Duration::from_secs(90));
+        assert_eq!(config.max_recent_turns, 24);
+    }
+
+    #[test]
+    fn rejects_invalid_optional_session_policy_values() {
+        let error = resolve(&[
+            ("DISCORD_BOT_TOKEN", "discord-token"),
+            ("GEMINI_API_KEY", "gemini-key"),
+            ("DISCORD_GUILD_ID", "123"),
+            ("DISCORD_OWNER_USER_ID", "456"),
+            ("DISCORD_VOICE_CHANNEL_NAME", "gemini-live"),
+            ("DISCORD_SESSION_IDLE_TIMEOUT_SECS", "0"),
+        ])
+        .expect_err("zero idle timeout should fail");
+
+        assert_eq!(
+            error,
+            ConfigError::InvalidPositiveInt {
+                key: "DISCORD_SESSION_IDLE_TIMEOUT_SECS",
+                value: "0".into(),
+            }
+        );
     }
 }

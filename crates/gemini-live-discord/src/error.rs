@@ -16,6 +16,8 @@ pub enum ConfigError {
     EmptyEnv { key: &'static str },
     #[error("environment variable {key} must be a non-zero Discord id, got {value:?}")]
     InvalidDiscordId { key: &'static str, value: String },
+    #[error("environment variable {key} must be a positive integer, got {value:?}")]
+    InvalidPositiveInt { key: &'static str, value: String },
 }
 
 /// Host-layer service errors.

@@ -610,13 +610,7 @@ async fn do_handshake(
     setup: &SetupConfig,
     resume_handle: Option<String>,
 ) -> Result<(), SessionError> {
-    let mut setup = setup.clone();
-    if let Some(handle) = resume_handle {
-        let sr = setup
-            .session_resumption
-            .get_or_insert_with(SessionResumptionConfig::default);
-        sr.handle = Some(handle);
-    }
+    let setup = setup_for_handshake(setup, resume_handle);
 
     let json = codec::encode(&ClientMessage::Setup(setup))?;
     tracing::debug!(setup_json = %json, "sending setup message");
@@ -627,6 +621,21 @@ async fn do_handshake(
     tokio::time::timeout(SETUP_TIMEOUT, wait_setup_complete(conn))
         .await
         .map_err(|_| SessionError::SetupTimeout(SETUP_TIMEOUT))?
+}
+
+fn setup_for_handshake(setup: &SetupConfig, resume_handle: Option<String>) -> SetupConfig {
+    let mut setup = setup.clone();
+    if let Some(handle) = resume_handle {
+        let sr = setup
+            .session_resumption
+            .get_or_insert_with(SessionResumptionConfig::default);
+        sr.handle = Some(handle);
+        // Initial-history mode is only valid on a fresh session before the
+        // first realtime input. Resumed sessions continue existing history and
+        // must not wait for new bootstrap `clientContent`.
+        setup.history_config = None;
+    }
+    setup
 }
 
 async fn wait_setup_complete(conn: &mut Connection) -> Result<(), SessionError> {
@@ -703,6 +712,7 @@ fn compute_backoff(policy: &ReconnectPolicy, attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use crate::error::{BearerTokenError, ConnectError};
+    use crate::types::HistoryConfig;
 
     use super::*;
 
@@ -758,6 +768,30 @@ mod tests {
         assert_eq!(p.base_backoff, Duration::from_millis(500));
         assert_eq!(p.max_backoff, Duration::from_secs(5));
         assert_eq!(p.max_attempts, Some(10));
+    }
+
+    #[test]
+    fn handshake_setup_strips_initial_history_when_resuming() {
+        let setup = SetupConfig {
+            model: "models/test".into(),
+            history_config: Some(HistoryConfig {
+                initial_history_in_client_content: Some(true),
+            }),
+            ..Default::default()
+        };
+
+        let resumed = setup_for_handshake(&setup, Some("resume-1".into()));
+        assert_eq!(
+            resumed
+                .session_resumption
+                .as_ref()
+                .and_then(|config| config.handle.as_deref()),
+            Some("resume-1")
+        );
+        assert!(resumed.history_config.is_none());
+
+        let fresh = setup_for_handshake(&setup, None);
+        assert_eq!(fresh.history_config, setup.history_config);
     }
 
     #[test]

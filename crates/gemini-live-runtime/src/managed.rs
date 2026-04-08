@@ -180,6 +180,81 @@ where
         Ok(())
     }
 
+    /// Connect a resumed session using a previously issued server handle.
+    ///
+    /// This is the hot-path used by higher-level session managers that wake a
+    /// dormant runtime back up without applying a staged setup change.
+    pub async fn connect_resumed(&mut self, resume_handle: String) -> Result<(), RuntimeError> {
+        self.cancel_task_set();
+        if self.core.session().is_some() {
+            self.core.close().await?;
+        }
+
+        let generation = self.current_generation();
+        self.emit_lifecycle(generation, RuntimeLifecycleEvent::Connecting);
+        let next_session = self
+            .core
+            .connect_with_setup(resumed_setup(
+                self.core.desired_setup().clone(),
+                resume_handle,
+            ))
+            .await?;
+        let (_, old_session) = self.core.install_connected_session(next_session);
+        debug_assert!(
+            old_session.is_none(),
+            "connect_resumed closed an unexpected old session"
+        );
+        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
+        self.tasks = Some(
+            self.spawn_task_set(
+                self.active_session()
+                    .expect("resumed runtime must expose an active session"),
+                Arc::clone(&self.active_tool_adapter),
+                Arc::clone(&self.resume_handle),
+                generation,
+            ),
+        );
+        self.emit_lifecycle(generation, RuntimeLifecycleEvent::Connected);
+        Ok(())
+    }
+
+    /// Connect a fresh session using a one-off setup override without staging it
+    /// into the runtime's steady-state desired setup.
+    ///
+    /// Hosts use this for bootstrap-only setup fields, such as initial-history
+    /// mode, that should only apply to the first turn on a fresh session.
+    pub async fn connect_with_setup_override(
+        &mut self,
+        setup: SetupConfig,
+    ) -> Result<(), RuntimeError> {
+        self.cancel_task_set();
+        if self.core.session().is_some() {
+            self.core.close().await?;
+        }
+        self.set_resume_handle(None);
+
+        let generation = self.current_generation();
+        self.emit_lifecycle(generation, RuntimeLifecycleEvent::Connecting);
+        let next_session = self.core.connect_with_setup(setup).await?;
+        let (_, old_session) = self.core.install_connected_session(next_session);
+        debug_assert!(
+            old_session.is_none(),
+            "connect_with_setup_override closed an unexpected old session"
+        );
+        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
+        self.tasks = Some(
+            self.spawn_task_set(
+                self.active_session()
+                    .expect("connected runtime must expose an active session"),
+                Arc::clone(&self.active_tool_adapter),
+                Arc::clone(&self.resume_handle),
+                generation,
+            ),
+        );
+        self.emit_lifecycle(generation, RuntimeLifecycleEvent::Connected);
+        Ok(())
+    }
+
     /// Apply the desired setup using the latest server-issued resumption handle
     /// so conversation state can carry over across the reconnect.
     pub async fn apply(&mut self) -> Result<ApplyReport, RuntimeError> {
@@ -292,6 +367,26 @@ where
             return Err(RuntimeError::NotConnected);
         };
         match session.send_text(text).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.emit_send_failure(
+                    self.current_generation(),
+                    RuntimeSendOperation::Text,
+                    error.to_string(),
+                );
+                Err(error.into())
+            }
+        }
+    }
+
+    pub async fn send_client_content(
+        &self,
+        content: gemini_live::types::ClientContent,
+    ) -> Result<(), RuntimeError> {
+        let Some(session) = self.active_session() else {
+            return Err(RuntimeError::NotConnected);
+        };
+        match session.send_client_content(content).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.emit_send_failure(
@@ -452,8 +547,9 @@ where
                         new_handle,
                         resumable,
                     } => {
-                        let next_handle = if resumable { new_handle.clone() } else { None };
-                        *resume_handle.lock().expect("resume handle lock") = next_handle;
+                        if resumable && let Some(handle) = new_handle.clone() {
+                            *resume_handle.lock().expect("resume handle lock") = Some(handle);
+                        }
                         let _ = tx.send(QueuedRuntimeEvent {
                             generation,
                             event: RuntimeEvent::Server(ServerEvent::SessionResumption {
@@ -654,6 +750,7 @@ fn resumed_setup(mut setup: SetupConfig, resume_handle: String) -> SetupConfig {
         .session_resumption
         .get_or_insert_with(SessionResumptionConfig::default);
     session_resumption.handle = Some(resume_handle);
+    setup.history_config = None;
     setup
 }
 
@@ -954,6 +1051,36 @@ mod tests {
             .await
             .expect_err("apply should require handle");
         assert!(matches!(error, RuntimeError::MissingResumeHandle));
+    }
+
+    #[tokio::test]
+    async fn non_resumable_updates_do_not_discard_last_good_handle() {
+        let session = FakeSession {
+            events: Arc::new(Mutex::new(VecDeque::from(vec![
+                ServerEvent::SessionResumption {
+                    new_handle: Some("resume-1".into()),
+                    resumable: true,
+                },
+                ServerEvent::SessionResumption {
+                    new_handle: None,
+                    resumable: false,
+                },
+            ]))),
+            ..FakeSession::default()
+        };
+        let driver = FakeDriver {
+            connects: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
+        };
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+
+        runtime.connect().await.expect("connect runtime");
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+
+        assert_eq!(runtime.latest_resume_handle().as_deref(), Some("resume-1"));
     }
 
     fn test_config() -> RuntimeConfig {

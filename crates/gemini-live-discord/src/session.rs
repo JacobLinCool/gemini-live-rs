@@ -12,23 +12,29 @@
 //! - `inputAudioTranscription = {}`
 //! - `outputAudioTranscription = {}`
 //! - `sessionResumption = {}`
+//! - `contextWindowCompression = { slidingWindow: {} }`
 //!
 //! Text chat still uses the same session via `send_text`, while text replies
-//! can be projected from the model's output transcription stream.
+//! can be projected from the model's output transcription stream. Initial
+//! history mode is enabled only on fresh rehydrate wakes, not on every session.
 
 use gemini_live::session::{ReconnectPolicy, SessionConfig};
 use gemini_live::transport::{Auth, TransportConfig};
 use gemini_live::types::{
-    AudioTranscriptionConfig, Content, GenerationConfig, Modality, Part, SessionResumptionConfig,
-    SetupConfig,
+    AudioTranscriptionConfig, Content, ContextWindowCompressionConfig, GenerationConfig, Modality,
+    Part, SessionResumptionConfig, SetupConfig, SlidingWindow,
 };
 use gemini_live_runtime::{
-    GeminiSessionDriver, ManagedRuntime, NoopToolAdapter, RuntimeConfig, RuntimeEventReceiver,
+    GeminiSessionDriver, IdlePolicy, InMemoryConversationMemory, ManagedRuntime, NoopToolAdapter,
+    RuntimeConfig, RuntimeEventReceiver, SessionManager,
 };
 
 use crate::config::DiscordBotConfig;
 
 pub type DiscordManagedRuntime = ManagedRuntime<GeminiSessionDriver, NoopToolAdapter>;
+pub type DiscordConversationMemory = InMemoryConversationMemory;
+pub type DiscordSessionManager =
+    SessionManager<GeminiSessionDriver, NoopToolAdapter, DiscordConversationMemory>;
 
 const DISCORD_SYSTEM_INSTRUCTION: &str = concat!(
     "You are an assistant talking with users on Discord. ",
@@ -48,6 +54,10 @@ pub fn build_live_setup(model: impl Into<String>) -> SetupConfig {
         input_audio_transcription: Some(AudioTranscriptionConfig {}),
         output_audio_transcription: Some(AudioTranscriptionConfig {}),
         session_resumption: Some(SessionResumptionConfig::default()),
+        context_window_compression: Some(ContextWindowCompressionConfig {
+            sliding_window: Some(SlidingWindow::default()),
+            trigger_tokens: None,
+        }),
         ..Default::default()
     }
 }
@@ -85,6 +95,24 @@ pub fn new_managed_runtime(
     )
 }
 
+pub fn new_session_manager(
+    config: &DiscordBotConfig,
+) -> (DiscordSessionManager, RuntimeEventReceiver) {
+    let (runtime, runtime_events) = new_managed_runtime(config);
+    (
+        SessionManager::new(
+            runtime,
+            InMemoryConversationMemory::new(),
+            IdlePolicy {
+                idle_timeout: config.idle_timeout,
+                max_recent_turns: config.max_recent_turns,
+                ..Default::default()
+            },
+        ),
+        runtime_events,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use gemini_live::transport::Auth;
@@ -100,6 +128,8 @@ mod tests {
             owner_user_id: UserId::new(456),
             voice_channel_name: "gemini-live".into(),
             model: "models/custom-live".into(),
+            idle_timeout: std::time::Duration::from_secs(90),
+            max_recent_turns: 24,
         }
     }
 
@@ -126,6 +156,14 @@ mod tests {
         assert!(setup.input_audio_transcription.is_some());
         assert!(setup.output_audio_transcription.is_some());
         assert!(setup.session_resumption.is_some());
+        assert_eq!(
+            setup.context_window_compression,
+            Some(ContextWindowCompressionConfig {
+                sliding_window: Some(SlidingWindow::default()),
+                trigger_tokens: None,
+            })
+        );
+        assert!(setup.history_config.is_none());
     }
 
     #[test]
@@ -136,5 +174,16 @@ mod tests {
             Auth::ApiKey(ref api_key) => assert_eq!(api_key, "gemini-key"),
             ref other => panic!("expected ApiKey auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_manager_uses_configured_idle_policy() {
+        let (manager, _events) = new_session_manager(&config());
+
+        assert_eq!(
+            manager.idle_policy().idle_timeout,
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(manager.idle_policy().max_recent_turns, 24);
     }
 }

@@ -8,9 +8,9 @@
 //!
 //! The receive side deliberately mirrors the desktop CLI's microphone
 //! semantics: while the bot is joined, it continuously streams owner audio
-//! into Gemini Live and fills silent ticks with zero PCM. That keeps turn
-//! boundary detection on the Gemini side instead of inventing a second VAD
-//! policy in Discord land.
+//! into Gemini Live on every 20 ms Discord voice tick and fills gaps with zero
+//! PCM. That keeps turn boundary detection on the Gemini side instead of
+//! inventing a second VAD policy in Discord land.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -18,11 +18,9 @@ use std::io::{
     Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Seek, SeekFrom,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use gemini_live_runtime::{GeminiSessionHandle, RuntimeSession};
 use serenity::all::{ChannelId, GuildId, UserId};
-use songbird::events::TrackEvent;
 use songbird::events::context_data::VoiceTick;
 use songbird::events::{CoreEvent, Event, EventContext, EventHandler};
 use songbird::input::codecs::{get_codec_registry, get_probe};
@@ -43,7 +41,7 @@ const PCM_I16_BYTES_PER_SAMPLE: usize = 2;
 const DISCORD_CAPTURE_FRAME_BYTES: usize =
     (DISCORD_CAPTURE_SAMPLE_RATE as usize * DISCORD_CAPTURE_TICK_MS / 1_000)
         * PCM_I16_BYTES_PER_SAMPLE;
-const GEMINI_STREAM_CHUNK_MS: usize = 100;
+const GEMINI_STREAM_CHUNK_MS: usize = DISCORD_CAPTURE_TICK_MS;
 const GEMINI_STREAM_CHUNK_BYTES: usize =
     (DISCORD_CAPTURE_SAMPLE_RATE as usize * GEMINI_STREAM_CHUNK_MS / 1_000)
         * PCM_I16_BYTES_PER_SAMPLE;
@@ -72,10 +70,6 @@ struct SpeakingStateHandler {
 
 struct VoiceTickHandler {
     shared: Arc<BridgeShared>,
-}
-
-struct PlaybackTrackEventLogger {
-    event: TrackEvent,
 }
 
 struct PlaybackSource {
@@ -138,7 +132,6 @@ impl VoiceBridge {
 
         let playback_track =
             configure_call(&call, Arc::clone(&shared), Arc::clone(&playback)).await?;
-        spawn_playback_track_observer(playback_track.clone());
 
         let owner_audio_task = spawn_owner_audio_forwarder(session.clone(), owner_audio_rx);
 
@@ -215,9 +208,8 @@ impl EventHandler for VoiceTickHandler {
         };
 
         let ssrc_to_user = self.shared.ssrc_to_user.lock().expect("ssrc map lock");
-        if let Some(pcm_i16_le) = owner_tick_pcm(self.shared.owner_user_id, &ssrc_to_user, tick) {
-            let _ = self.shared.owner_audio_tx.send(pcm_i16_le);
-        }
+        let frame = owner_tick_pcm(self.shared.owner_user_id, &ssrc_to_user, tick);
+        let _ = self.shared.owner_audio_tx.send(frame);
         None
     }
 }
@@ -228,28 +220,8 @@ impl PlaybackSource {
     }
 }
 
-#[serenity::async_trait]
-impl EventHandler for PlaybackTrackEventLogger {
-    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track(states) = ctx {
-            for (state, _) in *states {
-                tracing::info!(
-                    "Discord playback track event {:?}: mode={:?}, ready={:?}, position={:?}, play_time={:?}",
-                    self.event,
-                    state.playing,
-                    state.ready,
-                    state.position,
-                    state.play_time
-                );
-            }
-        }
-        None
-    }
-}
-
 impl Drop for PlaybackSource {
     fn drop(&mut self) {
-        tracing::debug!("Discord playback source dropped");
         clear_playback_queue(&self.shared);
         self.shared
             .state
@@ -321,6 +293,8 @@ async fn configure_call(
     playback: Arc<PlaybackShared>,
 ) -> Result<TrackHandle, DiscordServiceError> {
     let mut call = call.lock().await;
+    call.deafen(false).await?;
+    call.mute(false).await?;
     call.add_global_event(
         Event::Core(CoreEvent::SpeakingStateUpdate),
         SpeakingStateHandler {
@@ -329,13 +303,13 @@ async fn configure_call(
     );
     call.add_global_event(
         Event::Core(CoreEvent::VoiceTick),
-        VoiceTickHandler { shared },
+        VoiceTickHandler {
+            shared: Arc::clone(&shared),
+        },
     );
 
     let input = build_ready_live_pcm_input(playback).await?;
-    let playback_track = call.play_only_input(input);
-    install_playback_track_logging(&playback_track);
-    Ok(playback_track)
+    Ok(call.play_only_input(input))
 }
 
 fn build_live_pcm_input(stream: impl MediaSource + 'static, sample_rate: u32) -> Input {
@@ -351,38 +325,6 @@ async fn build_ready_live_pcm_input(
         .make_playable_async(get_codec_registry(), get_probe())
         .await
         .map_err(Into::into)
-}
-
-fn install_playback_track_logging(playback_track: &TrackHandle) {
-    for event in [
-        TrackEvent::Preparing,
-        TrackEvent::Playable,
-        TrackEvent::Error,
-        TrackEvent::End,
-    ] {
-        if let Err(error) =
-            playback_track.add_event(Event::Track(event), PlaybackTrackEventLogger { event })
-        {
-            tracing::warn!(
-                "failed to attach playback track logger for {:?}: {error}",
-                event
-            );
-        }
-    }
-}
-
-fn spawn_playback_track_observer(playback_track: TrackHandle) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        match playback_track.get_info().await {
-            Ok(state) => tracing::info!(
-                "Discord playback track state: mode={:?}, ready={:?}",
-                state.playing,
-                state.ready
-            ),
-            Err(error) => tracing::warn!("failed to query playback track state: {error}"),
-        }
-    });
 }
 
 fn spawn_owner_audio_forwarder(
@@ -422,7 +364,7 @@ fn owner_tick_pcm(
     owner_user_id: UserId,
     ssrc_to_user: &HashMap<u32, UserId>,
     tick: &VoiceTick,
-) -> Option<Vec<u8>> {
+) -> Vec<u8> {
     owner_tick_pcm_from_parts(
         owner_user_id,
         ssrc_to_user,
@@ -438,27 +380,29 @@ fn owner_tick_pcm_from_parts<'a>(
     ssrc_to_user: &HashMap<u32, UserId>,
     speaking: impl IntoIterator<Item = (u32, Option<&'a [i16]>)>,
     silent: impl IntoIterator<Item = u32>,
-) -> Option<Vec<u8>> {
+) -> Vec<u8> {
     for (ssrc, decoded_voice) in speaking {
         if ssrc_to_user.get(&ssrc) != Some(&owner_user_id) {
             continue;
         }
 
-        let pcm_i16_le = decoded_voice
+        return decoded_voice
             .map(decoded_voice_to_pcm_i16le)
             .filter(|pcm| !pcm.is_empty())
             .unwrap_or_else(silence_pcm_frame);
-        return Some(pcm_i16_le);
     }
 
     if silent
         .into_iter()
         .any(|ssrc| ssrc_to_user.get(&ssrc) == Some(&owner_user_id))
     {
-        return Some(silence_pcm_frame());
+        return silence_pcm_frame();
     }
 
-    None
+    // Keep the Live audio clock continuous even when Discord does not mention
+    // the owner in this tick. This matches the CLI mic path more closely and
+    // avoids long transcription latency caused by sparse receive-side timing.
+    silence_pcm_frame()
 }
 
 fn decoded_voice_to_pcm_i16le(decoded_voice: &[i16]) -> Vec<u8> {
@@ -563,11 +507,10 @@ mod tests {
         ssrc_to_user.insert(42, owner);
         let decoded = [0, i16::MAX];
 
-        let pcm =
-            owner_tick_pcm_from_parts(owner, &ssrc_to_user, [(42, Some(decoded.as_slice()))], [])
-                .expect("owner pcm");
+        let frame =
+            owner_tick_pcm_from_parts(owner, &ssrc_to_user, [(42, Some(decoded.as_slice()))], []);
 
-        assert_eq!(pcm, vec![0x00, 0x00, 0xff, 0x7f]);
+        assert_eq!(frame, vec![0x00, 0x00, 0xff, 0x7f]);
     }
 
     #[test]
@@ -576,18 +519,26 @@ mod tests {
         let mut ssrc_to_user = HashMap::new();
         ssrc_to_user.insert(42, owner);
 
-        let pcm = owner_tick_pcm_from_parts(owner, &ssrc_to_user, [], [42]).expect("owner silence");
+        let frame = owner_tick_pcm_from_parts(owner, &ssrc_to_user, [], [42]);
 
-        assert_eq!(pcm.len(), DISCORD_CAPTURE_FRAME_BYTES);
-        assert!(pcm.iter().all(|sample| *sample == 0));
+        assert_eq!(frame.len(), DISCORD_CAPTURE_FRAME_BYTES);
+        assert!(frame.iter().all(|sample| *sample == 0));
     }
 
     #[test]
-    fn audio_chunker_flushes_100ms_gemini_frames() {
-        let mut buffered = Vec::new();
-        for _ in 0..5 {
-            buffered.extend_from_slice(&silence_pcm_frame());
-        }
+    fn owner_tick_pcm_fills_silence_when_owner_absent_from_tick() {
+        let owner = UserId::new(7);
+        let ssrc_to_user = HashMap::new();
+
+        let frame = owner_tick_pcm_from_parts(owner, &ssrc_to_user, [], []);
+
+        assert_eq!(frame.len(), DISCORD_CAPTURE_FRAME_BYTES);
+        assert!(frame.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn audio_chunker_flushes_each_20ms_gemini_frame() {
+        let mut buffered = silence_pcm_frame();
 
         let chunk = take_ready_audio_chunk(&mut buffered).expect("ready chunk");
 

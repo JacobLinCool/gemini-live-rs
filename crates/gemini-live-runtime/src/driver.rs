@@ -4,7 +4,8 @@ use base64::Engine;
 use futures_util::future::BoxFuture;
 use gemini_live::session::{Session, SessionObservation};
 use gemini_live::types::{
-    Blob, ClientMessage, FunctionResponse, RealtimeInput, ServerEvent, ToolResponseMessage,
+    Blob, ClientContent, ClientMessage, FunctionResponse, RealtimeInput, ServerEvent,
+    ToolResponseMessage,
 };
 use gemini_live::{SessionConfig, SessionError, SessionStatus};
 
@@ -39,6 +40,13 @@ pub trait RuntimeSession: Clone + Send + Sync + 'static {
             }))
             .await
         })
+    }
+
+    fn send_client_content<'a>(
+        &'a self,
+        content: ClientContent,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move { self.send_raw(ClientMessage::ClientContent(content)).await })
     }
 
     fn send_audio_at_rate<'a>(
@@ -179,6 +187,13 @@ impl RuntimeSession for GeminiSessionHandle {
 
     fn send_text<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<(), SessionError>> {
         Box::pin(async move { self.inner.send_text(text).await })
+    }
+
+    fn send_client_content<'a>(
+        &'a self,
+        content: ClientContent,
+    ) -> BoxFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move { self.inner.send_client_content(content).await })
     }
 
     fn send_audio_at_rate<'a>(

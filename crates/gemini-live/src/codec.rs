@@ -190,6 +190,10 @@ mod tests {
             input_audio_transcription: Some(AudioTranscriptionConfig {}),
             output_audio_transcription: Some(AudioTranscriptionConfig {}),
             session_resumption: Some(SessionResumptionConfig { handle: None }),
+            context_window_compression: Some(ContextWindowCompressionConfig {
+                sliding_window: Some(SlidingWindow::default()),
+                trigger_tokens: None,
+            }),
             ..Default::default()
         });
         let json = encode(&msg).unwrap();
@@ -212,6 +216,10 @@ mod tests {
         // Presence-activated configs should appear as `{}`
         assert_eq!(setup["inputAudioTranscription"], serde_json::json!({}));
         assert_eq!(setup["outputAudioTranscription"], serde_json::json!({}));
+        assert_eq!(
+            setup["contextWindowCompression"],
+            serde_json::json!({ "slidingWindow": {} })
+        );
     }
 
     #[test]

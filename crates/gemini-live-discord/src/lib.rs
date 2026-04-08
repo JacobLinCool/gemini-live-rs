@@ -31,7 +31,8 @@ pub use gateway::gateway_intents;
 pub use policy::BotConversationScope;
 pub use service::{DiscordAgentService, DiscordServiceState, PreparedDiscordService};
 pub use session::{
-    DiscordManagedRuntime, build_live_setup, build_runtime_config, new_managed_runtime,
+    DiscordConversationMemory, DiscordManagedRuntime, DiscordSessionManager, build_live_setup,
+    build_runtime_config, new_managed_runtime, new_session_manager,
 };
 pub use setup::{
     SetupAction, TargetChannelSummary, ensure_target_voice_channel, plan_voice_channel,

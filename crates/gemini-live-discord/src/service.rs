@@ -341,7 +341,7 @@ impl SharedBotState {
     async fn push_model_audio(&self, pcm_i16_le_24k: Vec<u8>) -> Result<(), DiscordServiceError> {
         let guard = self.inner.voice_bridge.lock().await;
         if let Some(bridge) = guard.as_ref() {
-            bridge.push_model_audio(pcm_i16_le_24k)?;
+            bridge.push_model_audio(pcm_i16_le_24k).await?;
         }
         Ok(())
     }

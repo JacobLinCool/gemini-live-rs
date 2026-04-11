@@ -7,6 +7,9 @@
 //! When upstream model families differ, prefer documenting the difference on
 //! the exact field or type that carries it.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 // ── Generation config ────────────────────────────────────────────────────────
@@ -89,13 +92,69 @@ pub struct ThinkingConfig {
     pub include_thoughts: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     Minimal,
     Low,
     Medium,
     High,
+}
+
+impl ThinkingLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseThinkingLevelError {
+    raw: String,
+}
+
+impl ParseThinkingLevelError {
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl fmt::Display for ParseThinkingLevelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unsupported thinking level {:?}; expected one of: minimal, low, medium, high",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for ParseThinkingLevelError {}
+
+impl FromStr for ThinkingLevel {
+    type Err = ParseThinkingLevelError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err(ParseThinkingLevelError {
+                raw: raw.to_string(),
+            }),
+        }
+    }
 }
 
 // ── Media resolution ─────────────────────────────────────────────────────────

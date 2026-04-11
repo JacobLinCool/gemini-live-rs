@@ -16,6 +16,7 @@ vertex-auth = ["gemini-live/vertex-auth"]
 
 [dependencies]
 gemini-live = { workspace = true }
+gemini-live-harness = { workspace = true }
 gemini-live-io = { workspace = true }
 gemini-live-runtime = { workspace = true }
 gemini-live-tools = { workspace = true }
@@ -28,7 +29,6 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 shlex = "1.3"
-toml = "0.8"
 tui-textarea = "0.7"
 hound = "3.5"
 ratatui = "0.29"

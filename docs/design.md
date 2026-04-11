@@ -40,11 +40,15 @@ Tracked in [`roadmap.md`](roadmap.md) items **P-1** through **P-5**.
 ┌──────────────────────────────────────────────────────────────┐
 │              Host Applications (`cli` / `discord`)           │
 ├──────────────────────────────────────────────────────────────┤
-│  Desktop Media Adapters (`gemini-live-io`)                   │
-│  Mic capture · speaker playback · screen capture             │
+│  Host-Specific Adapters                                      │
+│  `gemini-live-io` for desktop hosts; Discord gateway/voice   │
+│  stays inside `gemini-live-discord`                          │
+├──────────────────────────────────────────────────────────────┤
+│  Harness Layer (`gemini-live-harness`)                       │
+│  Durable tasks · durable notifications · durable memory      │
 ├──────────────────────────────────────────────────────────────┤
 │  Runtime Layer (`gemini-live-runtime`)                       │
-│  Staged setup · driver boundary · reusable host contracts    │
+│  Staged setup · driver boundary · hot/dormant lifecycle      │
 ├──────────────────────────────────────────────────────────────┤
 │  Session Layer (session.rs)                                  │
 │  Connection lifecycle · auto-reconnect · session resumption  │
@@ -87,9 +91,14 @@ Multiple async tasks often need to hold the same session simultaneously (one sen
 
 ### ADR-5: Audio encoder buffer reuse
 
-`AudioEncoder` writes the PCM → base64 conversion into pre-allocated internal buffers and returns a borrowed `&str`. Callers reuse the same `AudioEncoder` instance in a loop, producing **no heap allocations** on the hot path.
+`AudioEncoder` writes the PCM → base64 conversion into pre-allocated internal
+buffers and returns a borrowed `&str`. After the encoder has established enough
+capacity, the encoding step itself avoids further heap allocation.
 
-**Note:** the current `Session::send_audio` convenience method does **not** use `AudioEncoder` — it calls `STANDARD.encode()` which allocates a new `String` each time. Callers needing maximum performance should use `AudioEncoder` + `Session::send_raw` directly. This is a known gap (see [`roadmap.md`](roadmap.md) **P-1**).
+**Note:** the current full send path still allocates when building owned
+message payloads and when `codec::encode` serializes JSON. `Session::send_audio`
+also still calls `STANDARD.encode()` directly. See [`roadmap.md`](roadmap.md)
+items **P-1** and **P-2**.
 
 ### ADR-6: CLI setup changes are staged, then applied via explicit reconnect
 
@@ -109,10 +118,14 @@ server-issued resumption handle is available, so conversation state can carry
 over across the reconnect. If the server has not published a handle yet, the
 apply fails explicitly instead of silently falling back to a fresh session.
 
-### ADR-7: CLI user preferences live in a global named-profile store
+### ADR-7: CLI user preferences live in harness-managed named profiles
 
-The CLI now persists user-facing configuration in a global TOML file keyed by
-profile name. A profile captures:
+The CLI now persists user-facing configuration inside the harness-owned profile
+namespace. Each profile maps to one durable harness root under
+`~/.gemini-live/harness/profiles/<profile>/`, and CLI-specific settings live in
+`config/cli.json` within that root.
+
+A profile captures:
 
 - backend selection and credentials
 - model selection
@@ -126,8 +139,9 @@ resolved values are then written back to the active profile so one explicit run
 can seed future launches.
 
 This design keeps startup deterministic and easy to explain: the active
-profile is the durable source of truth, while environment variables remain a
-simple override layer for automation or one-off launches.
+profile is the durable source of truth for both CLI config and harness state,
+while environment variables remain a simple override layer for automation or
+one-off launches.
 
 ### ADR-8: Reusable host orchestration lives outside the CLI binary
 
@@ -139,8 +153,14 @@ That crate is the natural home for:
 
 - staged-vs-active `setup` orchestration
 - a testable session-driver abstraction above `Session`
-- shared runtime event and tool-execution contracts
-- managed session forwarding and tool-call orchestration (`ManagedRuntime`)
+- shared runtime events for session forwarding and tool-call request fanout
+- managed session forwarding above the Live session layer (`ManagedRuntime`)
+
+The adjacent durable `gemini-live-harness` crate is now the natural home for:
+
+- shared host tool execution contracts
+- durable task, notification, and memory persistence
+- harness-owned inline budget wrappers around blocking host tools
 
 This avoids turning the CLI into the accidental source of truth for reusable
 application logic, and it avoids creating a vague "utils" crate with no
@@ -190,12 +210,30 @@ That crate is the natural home for:
 - function declarations and validation shared across hosts
 
 The CLI continues to own host-specific composition, slash-command UX, desktop
-device wiring, and profile persistence. This keeps low-coupling tool logic out
-of the binary crate without pretending that desktop controls are already
-portable enough to deserve the same treatment.
+device wiring, and CLI-specific profile contents layered on top of the
+harness-owned profile root. This keeps low-coupling tool logic out of the
+binary crate without pretending that desktop controls are already portable
+enough to deserve the same treatment.
 
 Desktop controls that mutate mic / speaker / screen-share state still remain
 CLI-local. They now cross the tool/runtime boundary through an explicit
 request-response port instead of reaching directly into terminal state. That
 keeps the execution contract testable without claiming the tool family is
 portable enough to move into `gemini-live-tools`.
+
+### ADR-12: Durable harness state lives on disk, not in process memory
+
+The workspace now also has a dedicated `gemini-live-harness` crate for the
+control plane above `gemini-live-runtime` and below a concrete host.
+
+That crate is the natural home for:
+
+- durable delegated-task state under a filesystem root
+- durable notification queues that survive process death
+- durable long-running memory records that other local agents can inspect
+- durable task, notification, and memory state managed behind host-facing harness APIs
+
+The source of truth is the filesystem, not process memory. Any in-memory data
+inside a host or worker is therefore only a cache or a transient execution
+handle. Recovery after a crash or restart must be possible by scanning the
+filesystem layout alone.

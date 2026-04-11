@@ -49,20 +49,23 @@ cargo run -p gemini-live-cli -- config
 
 ## Profiles & Config
 
-The CLI persists global configuration in:
+The harness now owns the filesystem-level profile mechanism. Each CLI profile
+maps to one harness profile root under the local harness directory:
 
-- `$XDG_CONFIG_HOME/gemini-live/config.toml`
-- or `~/.config/gemini-live/config.toml` when `XDG_CONFIG_HOME` is unset
-- or `%APPDATA%\\gemini-live\\config.toml` on Windows
+- `~/.gemini-live/harness/profiles/<profile>/`
 
-Profiles are keyed by name inside that file. If `--profile <name>` refers to a
-missing profile, the CLI creates it automatically and saves resolved settings
-into it.
+CLI-specific config for that profile is stored inside the same root:
+
+- `~/.gemini-live/harness/profiles/<profile>/config/cli.json`
+
+If `--profile <name>` refers to a missing profile, the CLI creates it
+automatically and saves resolved settings into that harness profile root.
 
 The selected profile persists:
 
 - backend selection and credentials
 - model
+- thinking level
 - system instruction
 - enabled tools
 - microphone / speaker auto-start state
@@ -75,8 +78,9 @@ Startup precedence is:
 3. Built-in defaults
 
 Resolved startup settings are written back to the active profile, so exporting
-`GEMINI_API_KEY` or `GEMINI_MODEL` for one run is enough to seed a profile for
-later runs. This file may therefore contain plaintext credentials.
+`GEMINI_API_KEY`, `GEMINI_MODEL`, or `GEMINI_THINKING_LEVEL` for one run is
+enough to seed a profile for later runs. This file may therefore contain
+plaintext credentials.
 
 ## Canonical Behavior
 
@@ -140,7 +144,7 @@ spaces are not supported yet.
 | `/system apply` | Reconnect the Live session with the staged system instruction and staged tools, carrying conversation state when a resume handle is available. |
 | `/tools` | Show active vs staged tool profile. |
 | `/tools list` | List the known tools and their current state (`active`, `staged`, `off`). |
-| `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `list-files`, `read-file`, `run-command`, plus feature-gated CLI-local desktop tools such as `desktop-microphone`, `desktop-speaker`, and `desktop-screen-share`. |
+| `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `timer`, `list-files`, `read-file`, `run-command`, plus feature-gated CLI-local desktop tools such as `desktop-microphone`, `desktop-speaker`, and `desktop-screen-share`. |
 | `/tools disable <tool>` | Stage a tool removal for the next applied session. |
 | `/tools toggle <tool>` | Flip a tool in the staged profile. |
 | `/tools apply` | Reconnect the Live session with the staged tool profile, carrying conversation state when a resume handle is available. |
@@ -188,16 +192,18 @@ input.rs                 Single-line editor wrapper built on `tui-textarea`
 slash.rs                 Structured slash-command parsing (`clap`) + completion model
 media.rs                 @file loading: image/audio detection, WAV decoding, mono mixdown
 outbound.rs              User-input/media send ordering above `RuntimeSession`
-tooling.rs               CLI-local tool profile + ToolAdapter composition over shared tool families
+tooling.rs               CLI-local tool profile + host-fed ToolProvider/ToolExecutor composition
 desktop_control.rs       CLI-local request-response port for model-invoked desktop controls
-gemini-live-tools        Shared workspace tool declarations and executors reused by hosts
+gemini-live-tools        Shared timer/workspace tool declarations and executors reused by hosts
 gemini-live-runtime      Shared staged-setup + managed runtime orchestration reused by hosts
+gemini-live-harness      Durable harness state + shared tool contracts + budget-wrapped execution
 gemini-live-io           Shared desktop mic / speaker / screen adapters reused by hosts
 ```
 
 The CLI now delegates session switchover, session-event forwarding, and
-tool-call orchestration to `gemini-live-runtime`, keeps slash-command and
-runtime-event state reduction in `app.rs`, and uses
+tool-call request fanout to `gemini-live-runtime`; shared tool execution and
+budget-wrapped background handoff live in `gemini-live-harness`. The CLI keeps
+slash-command and runtime-event state reduction in `app.rs`, and uses
 `tokio::select!` to concurrently poll:
 1. Terminal key events (crossterm `EventStream`)
 2. Runtime events (via `RuntimeEventReceiver`)
@@ -227,8 +233,9 @@ than the canonical home of code-representable behavior.
   server has already issued a resume handle; applying immediately after first
   connect may still fail until that handle exists.
 - Local tools are intentionally narrow: `read-file` only reads UTF-8 text,
-  `list-files` stays inside the current workspace root, and `run-command`
-  executes argv-only commands without a shell.
+  `list-files` stays inside the current workspace root, `run-command`
+  executes argv-only commands without a shell, and `timer` waits for a fixed
+  duration so the harness can continue it in the background when needed.
 - Screen-share startup uses the saved numeric target id. If monitor/window
   ordering changes between runs, the saved target may no longer point at the
   same surface.

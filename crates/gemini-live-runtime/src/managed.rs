@@ -1,32 +1,24 @@
-//! Host-managed runtime that owns session forwarding and tool-call orchestration.
+//! Host-managed runtime that owns session forwarding and tool-call fanout.
 //!
-//! [`LiveRuntime`] remains the low-level staged-session
-//! primitive. This module layers on the long-lived async tasks that hosts would
-//! otherwise duplicate:
+//! [`LiveRuntime`] remains the low-level staged-session primitive. This module
+//! layers on the long-lived async tasks that hosts would otherwise duplicate:
 //!
 //! - forwarding session events onto a single runtime event stream
-//! - intercepting `toolCall` / `toolCallCancellation`
-//! - dispatching host tools and sending `toolResponse`
+//! - surfacing `toolCall` / `toolCallCancellation` requests to the host
 //! - suppressing stale events across fresh-session apply boundaries
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use gemini_live::types::{
-    FunctionCallRequest, FunctionResponse, ServerEvent, SessionResumptionConfig, SetupConfig,
-};
+use gemini_live::types::{FunctionResponse, ServerEvent, SessionResumptionConfig, SetupConfig};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::config::{RuntimeConfig, SetupPatch};
 use crate::driver::{RuntimeSession, RuntimeSessionObservation, SessionDriver};
-use crate::error::{RuntimeError, ToolExecutionError};
-use crate::event::{
-    RuntimeEvent, RuntimeLifecycleEvent, RuntimeSendFailure, RuntimeSendOperation, ToolCallOutcome,
-};
+use crate::error::RuntimeError;
+use crate::event::{RuntimeEvent, RuntimeLifecycleEvent, RuntimeSendFailure, RuntimeSendOperation};
 use crate::runtime::{ApplyReport, LiveRuntime};
-use crate::tool::ToolAdapter;
 
 #[derive(Debug)]
 struct QueuedRuntimeEvent {
@@ -61,50 +53,37 @@ impl RuntimeEventReceiver {
     }
 }
 
-struct PendingToolTask {
-    name: String,
-    handle: JoinHandle<()>,
-}
-
 struct RuntimeTaskSet {
     forwarder: JoinHandle<()>,
-    pending_tools: Arc<Mutex<HashMap<String, PendingToolTask>>>,
 }
 
 /// Higher-level runtime that owns the async orchestration around [`LiveRuntime`].
 ///
-/// Hosts still own their own UI, persistence, and device I/O, but no longer
-/// need to duplicate a second event/task layer on top of the staged-session
-/// runtime core.
-pub struct ManagedRuntime<D, A>
+/// Hosts still own their own UI, persistence, background workers, and tool
+/// execution policy, but no longer need to duplicate a second session
+/// forwarding layer on top of the staged-session runtime core.
+pub struct ManagedRuntime<D>
 where
     D: SessionDriver,
-    A: ToolAdapter,
 {
     core: LiveRuntime<D>,
-    active_tool_adapter: Arc<A>,
-    desired_tool_adapter: Arc<A>,
     resume_handle: Arc<Mutex<Option<String>>>,
     generation: Arc<AtomicU64>,
     event_tx: mpsc::UnboundedSender<QueuedRuntimeEvent>,
     tasks: Option<RuntimeTaskSet>,
 }
 
-impl<D, A> ManagedRuntime<D, A>
+impl<D> ManagedRuntime<D>
 where
     D: SessionDriver,
-    A: ToolAdapter,
 {
-    pub fn new(config: RuntimeConfig, driver: D, tool_adapter: A) -> (Self, RuntimeEventReceiver) {
+    pub fn new(config: RuntimeConfig, driver: D) -> (Self, RuntimeEventReceiver) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let generation = Arc::new(AtomicU64::new(0));
-        let tool_adapter = Arc::new(tool_adapter);
         let resume_handle = Arc::new(Mutex::new(None));
         (
             Self {
                 core: LiveRuntime::new(config, driver),
-                active_tool_adapter: Arc::clone(&tool_adapter),
-                desired_tool_adapter: tool_adapter,
                 resume_handle: Arc::clone(&resume_handle),
                 generation: Arc::clone(&generation),
                 event_tx,
@@ -148,14 +127,6 @@ where
             .clone()
     }
 
-    pub fn replace_desired_tool_adapter(&mut self, tool_adapter: A) {
-        self.desired_tool_adapter = Arc::new(tool_adapter);
-    }
-
-    pub fn discard_staged_tool_adapter(&mut self) {
-        self.desired_tool_adapter = Arc::clone(&self.active_tool_adapter);
-    }
-
     pub async fn connect(&mut self) -> Result<(), RuntimeError> {
         self.cancel_task_set();
         if self.core.session().is_some() {
@@ -166,12 +137,10 @@ where
         let generation = self.current_generation();
         self.emit_lifecycle(generation, RuntimeLifecycleEvent::Connecting);
         self.core.connect().await?;
-        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
         self.tasks = Some(
             self.spawn_task_set(
                 self.active_session()
                     .expect("connected runtime must expose an active session"),
-                Arc::clone(&self.active_tool_adapter),
                 Arc::clone(&self.resume_handle),
                 generation,
             ),
@@ -204,12 +173,10 @@ where
             old_session.is_none(),
             "connect_resumed closed an unexpected old session"
         );
-        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
         self.tasks = Some(
             self.spawn_task_set(
                 self.active_session()
                     .expect("resumed runtime must expose an active session"),
-                Arc::clone(&self.active_tool_adapter),
                 Arc::clone(&self.resume_handle),
                 generation,
             ),
@@ -241,12 +208,10 @@ where
             old_session.is_none(),
             "connect_with_setup_override closed an unexpected old session"
         );
-        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
         self.tasks = Some(
             self.spawn_task_set(
                 self.active_session()
                     .expect("connected runtime must expose an active session"),
-                Arc::clone(&self.active_tool_adapter),
                 Arc::clone(&self.resume_handle),
                 generation,
             ),
@@ -276,12 +241,10 @@ where
         self.cancel_task_set();
         let (report, old_session) = self.core.install_connected_session(next_session);
         self.generation.store(next_generation, Ordering::SeqCst);
-        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
         self.tasks = Some(
             self.spawn_task_set(
                 self.active_session()
                     .expect("applied runtime must expose an active session"),
-                Arc::clone(&self.active_tool_adapter),
                 Arc::clone(&self.resume_handle),
                 next_generation,
             ),
@@ -316,13 +279,11 @@ where
         self.cancel_task_set();
         let (report, old_session) = self.core.install_connected_session(next_session);
         self.generation.store(next_generation, Ordering::SeqCst);
-        self.active_tool_adapter = Arc::clone(&self.desired_tool_adapter);
         self.set_resume_handle(None);
         self.tasks = Some(
             self.spawn_task_set(
                 self.active_session()
                     .expect("applied runtime must expose an active session"),
-                Arc::clone(&self.active_tool_adapter),
                 Arc::clone(&self.resume_handle),
                 next_generation,
             ),
@@ -437,6 +398,26 @@ where
         }
     }
 
+    pub async fn send_tool_response(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<(), RuntimeError> {
+        let Some(session) = self.active_session() else {
+            return Err(RuntimeError::NotConnected);
+        };
+        match session.send_tool_response(responses).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.emit_send_failure(
+                    self.current_generation(),
+                    RuntimeSendOperation::ToolResponse,
+                    error.to_string(),
+                );
+                Err(error.into())
+            }
+        }
+    }
+
     pub async fn audio_stream_end(&self) -> Result<(), RuntimeError> {
         let Some(session) = self.active_session() else {
             return Err(RuntimeError::NotConnected);
@@ -493,44 +474,34 @@ where
     fn spawn_task_set(
         &self,
         session: D::Session,
-        tool_adapter: Arc<A>,
         resume_handle: Arc<Mutex<Option<String>>>,
         generation: u64,
     ) -> RuntimeTaskSet {
-        let pending_tools = Arc::new(Mutex::new(HashMap::new()));
-        let forwarder = spawn_session_forwarder(
-            session,
-            tool_adapter,
-            resume_handle,
-            self.event_tx.clone(),
-            generation,
-            Arc::clone(&pending_tools),
-        );
         RuntimeTaskSet {
-            forwarder,
-            pending_tools,
+            forwarder: spawn_session_forwarder(
+                session,
+                resume_handle,
+                self.event_tx.clone(),
+                generation,
+            ),
         }
     }
 
     fn cancel_task_set(&mut self) {
         if let Some(tasks) = self.tasks.take() {
-            abort_pending_tools(&tasks.pending_tools);
             tasks.forwarder.abort();
         }
     }
 }
 
-fn spawn_session_forwarder<S, A>(
+fn spawn_session_forwarder<S>(
     session: S,
-    tool_adapter: Arc<A>,
     resume_handle: Arc<Mutex<Option<String>>>,
     tx: mpsc::UnboundedSender<QueuedRuntimeEvent>,
     generation: u64,
-    pending_tools: Arc<Mutex<HashMap<String, PendingToolTask>>>,
 ) -> JoinHandle<()>
 where
     S: RuntimeSession,
-    A: ToolAdapter,
 {
     tokio::spawn(async move {
         let mut recv = session;
@@ -560,52 +531,17 @@ where
                     }
                     ServerEvent::ToolCall(calls) => {
                         for call in calls {
-                            let call_id = call.id.clone();
-                            let call_name = call.name.clone();
                             let _ = tx.send(QueuedRuntimeEvent {
                                 generation,
-                                event: RuntimeEvent::ToolCallStarted {
-                                    id: call_id.clone(),
-                                    name: call_name.clone(),
-                                },
+                                event: RuntimeEvent::ToolCallRequested { call },
                             });
-
-                            let handle = spawn_tool_call(
-                                Arc::clone(&tool_adapter),
-                                recv.clone(),
-                                tx.clone(),
-                                generation,
-                                call,
-                                Arc::clone(&pending_tools),
-                            );
-                            pending_tools.lock().expect("pending tools lock").insert(
-                                call_id,
-                                PendingToolTask {
-                                    name: call_name,
-                                    handle,
-                                },
-                            );
                         }
                     }
                     ServerEvent::ToolCallCancellation(ids) => {
-                        for call_id in ids {
-                            tool_adapter.cancel(&call_id);
-                            if let Some(pending) = pending_tools
-                                .lock()
-                                .expect("pending tools lock")
-                                .remove(&call_id)
-                            {
-                                pending.handle.abort();
-                                let _ = tx.send(QueuedRuntimeEvent {
-                                    generation,
-                                    event: RuntimeEvent::ToolCallFinished {
-                                        id: call_id,
-                                        name: pending.name,
-                                        outcome: ToolCallOutcome::Cancelled,
-                                    },
-                                });
-                            }
-                        }
+                        let _ = tx.send(QueuedRuntimeEvent {
+                            generation,
+                            event: RuntimeEvent::ToolCallCancellationRequested { ids },
+                        });
                     }
                     ServerEvent::Closed { reason } => {
                         let _ = tx.send(QueuedRuntimeEvent {
@@ -624,125 +560,7 @@ where
                 },
             }
         }
-
-        fail_pending_tools(
-            &pending_tools,
-            &tx,
-            generation,
-            "session event stream ended".to_string(),
-        );
     })
-}
-
-fn spawn_tool_call<S, A>(
-    tool_adapter: Arc<A>,
-    session: S,
-    tx: mpsc::UnboundedSender<QueuedRuntimeEvent>,
-    generation: u64,
-    call: FunctionCallRequest,
-    pending_tools: Arc<Mutex<HashMap<String, PendingToolTask>>>,
-) -> JoinHandle<()>
-where
-    S: RuntimeSession,
-    A: ToolAdapter,
-{
-    tokio::spawn(async move {
-        let call_id = call.id.clone();
-        let call_name = call.name.clone();
-        let response = match tool_adapter.execute(call).await {
-            Ok(response) => response,
-            Err(ToolExecutionError::Cancelled { .. }) => {
-                pending_tools
-                    .lock()
-                    .expect("pending tools lock")
-                    .remove(&call_id);
-                let _ = tx.send(QueuedRuntimeEvent {
-                    generation,
-                    event: RuntimeEvent::ToolCallFinished {
-                        id: call_id,
-                        name: call_name,
-                        outcome: ToolCallOutcome::Cancelled,
-                    },
-                });
-                return;
-            }
-            Err(error) => tool_error_response(&call_id, &call_name, error),
-        };
-
-        let outcome = match session.send_tool_response(vec![response]).await {
-            Ok(()) => ToolCallOutcome::Responded,
-            Err(error) => {
-                let reason = error.to_string();
-                let _ = tx.send(QueuedRuntimeEvent {
-                    generation,
-                    event: RuntimeEvent::SendFailed(RuntimeSendFailure {
-                        operation: RuntimeSendOperation::ToolResponse,
-                        reason: reason.clone(),
-                    }),
-                });
-                ToolCallOutcome::Failed { reason }
-            }
-        };
-
-        pending_tools
-            .lock()
-            .expect("pending tools lock")
-            .remove(&call_id);
-        let _ = tx.send(QueuedRuntimeEvent {
-            generation,
-            event: RuntimeEvent::ToolCallFinished {
-                id: call_id,
-                name: call_name,
-                outcome,
-            },
-        });
-    })
-}
-
-fn tool_error_response(
-    call_id: &str,
-    call_name: &str,
-    error: ToolExecutionError,
-) -> FunctionResponse {
-    FunctionResponse {
-        id: call_id.to_string(),
-        name: call_name.to_string(),
-        response: serde_json::json!({
-            "ok": false,
-            "error": {
-                "message": error.to_string(),
-            },
-        }),
-    }
-}
-
-fn abort_pending_tools(pending_tools: &Arc<Mutex<HashMap<String, PendingToolTask>>>) {
-    let mut pending_tools = pending_tools.lock().expect("pending tools lock");
-    for (_, pending) in pending_tools.drain() {
-        pending.handle.abort();
-    }
-}
-
-fn fail_pending_tools(
-    pending_tools: &Arc<Mutex<HashMap<String, PendingToolTask>>>,
-    tx: &mpsc::UnboundedSender<QueuedRuntimeEvent>,
-    generation: u64,
-    reason: String,
-) {
-    let mut pending_tools = pending_tools.lock().expect("pending tools lock");
-    for (id, pending) in pending_tools.drain() {
-        pending.handle.abort();
-        let _ = tx.send(QueuedRuntimeEvent {
-            generation,
-            event: RuntimeEvent::ToolCallFinished {
-                id,
-                name: pending.name,
-                outcome: ToolCallOutcome::Failed {
-                    reason: reason.clone(),
-                },
-            },
-        });
-    }
 }
 
 fn resumed_setup(mut setup: SetupConfig, resume_handle: String) -> SetupConfig {
@@ -762,12 +580,15 @@ mod tests {
 
     use futures_util::future::BoxFuture;
     use gemini_live::transport::TransportConfig;
-    use gemini_live::types::{ClientMessage, GoogleSearchTool, ServerEvent, SetupConfig, Tool};
+    use gemini_live::types::{
+        ClientMessage, FunctionCallRequest, FunctionResponse, GoogleSearchTool, ServerEvent,
+        SetupConfig, Tool,
+    };
     use gemini_live::{ReconnectPolicy, SessionError, SessionStatus};
 
     use super::*;
+    use crate::RuntimeConfig;
     use crate::driver::SessionDriver;
-    use crate::{RuntimeConfig, ToolDescriptor, ToolKind};
 
     #[derive(Clone, Default)]
     struct FakeDriver {
@@ -864,32 +685,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct FakeToolAdapter;
-
-    impl ToolAdapter for FakeToolAdapter {
-        fn descriptors(&self) -> Vec<ToolDescriptor> {
-            vec![ToolDescriptor {
-                key: "fake".into(),
-                summary: "fake".into(),
-                kind: ToolKind::Local,
-            }]
-        }
-
-        fn execute<'a>(
-            &'a self,
-            call: FunctionCallRequest,
-        ) -> BoxFuture<'a, Result<FunctionResponse, ToolExecutionError>> {
-            Box::pin(async move {
-                Ok(FunctionResponse {
-                    id: call.id,
-                    name: call.name,
-                    response: serde_json::json!({ "ok": true }),
-                })
-            })
-        }
-    }
-
     #[tokio::test]
     async fn connect_emits_lifecycle_and_forwards_server_events() {
         let session = FakeSession {
@@ -902,7 +697,7 @@ mod tests {
             connects: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
         };
-        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
 
@@ -921,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_calls_are_executed_and_reported() {
+    async fn tool_calls_are_forwarded_as_requests() {
         let session = FakeSession {
             events: Arc::new(Mutex::new(VecDeque::from(vec![ServerEvent::ToolCall(
                 vec![FunctionCallRequest {
@@ -933,12 +728,11 @@ mod tests {
             hold_open: true,
             ..FakeSession::default()
         };
-        let sent = Arc::clone(&session.sent);
         let driver = FakeDriver {
             connects: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
         };
-        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
         let _ = rx.recv().await;
@@ -946,13 +740,31 @@ mod tests {
 
         assert!(matches!(
             rx.recv().await,
-            Some(RuntimeEvent::ToolCallStarted { id, name }) if id == "call-1" && name == "fake"
+            Some(RuntimeEvent::ToolCallRequested { call })
+                if call.id == "call-1" && call.name == "fake"
         ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(RuntimeEvent::ToolCallFinished { id, name, outcome: ToolCallOutcome::Responded })
-                if id == "call-1" && name == "fake"
-        ));
+    }
+
+    #[tokio::test]
+    async fn tool_call_responses_are_sent_through_runtime() {
+        let session = FakeSession::default();
+        let sent = Arc::clone(&session.sent);
+        let driver = FakeDriver {
+            connects: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
+        };
+        let (mut runtime, _rx) = ManagedRuntime::new(test_config(), driver);
+
+        runtime.connect().await.expect("connect runtime");
+        runtime
+            .send_tool_response(vec![FunctionResponse {
+                id: "call-1".into(),
+                name: "fake".into(),
+                response: serde_json::json!({ "ok": true }),
+            }])
+            .await
+            .expect("send tool response");
+
         let sent = sent.lock().expect("sent lock");
         assert!(matches!(sent.as_slice(), [ClientMessage::ToolResponse(_)]));
     }
@@ -969,7 +781,7 @@ mod tests {
             connects: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
         };
-        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
         let _ = rx.recv().await;
@@ -1002,7 +814,7 @@ mod tests {
             ]))),
         };
         let connects = Arc::clone(&driver.connects);
-        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
         let _ = rx.recv().await;
@@ -1042,7 +854,7 @@ mod tests {
             connects: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
         };
-        let (mut runtime, _rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, _rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
 
@@ -1072,7 +884,7 @@ mod tests {
             connects: Arc::new(Mutex::new(Vec::new())),
             sessions: Arc::new(Mutex::new(VecDeque::from(vec![session]))),
         };
-        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver, FakeToolAdapter);
+        let (mut runtime, mut rx) = ManagedRuntime::new(test_config(), driver);
 
         runtime.connect().await.expect("connect runtime");
         let _ = rx.recv().await;

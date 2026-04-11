@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = DiscordBotConfig::from_env()?;
-    if let Err(error) = DiscordAgentService::new(config).prepare().run().await {
+    if let Err(error) = DiscordAgentService::new(config).prepare()?.run().await {
         eprintln!("Error: {error}");
         if let Some(hint) = error.startup_hint() {
             eprintln!("{hint}");

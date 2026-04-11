@@ -174,6 +174,14 @@ enum CliSystemCommand {
 enum CliToolArg {
     #[value(name = "google-search", alias = "google_search", alias = "search")]
     GoogleSearch,
+    #[value(
+        name = "timer",
+        alias = "set-timer",
+        alias = "set_timer",
+        alias = "alert",
+        alias = "reminder"
+    )]
+    Timer,
     #[value(name = "list-files", alias = "list_files", alias = "list")]
     ListFiles,
     #[value(name = "read-file", alias = "read_file", alias = "read")]
@@ -255,6 +263,7 @@ impl From<CliToolArg> for ToolId {
     fn from(value: CliToolArg) -> Self {
         match value {
             CliToolArg::GoogleSearch => Self::GoogleSearch,
+            CliToolArg::Timer => Self::Timer,
             CliToolArg::ListFiles => Self::ListFiles,
             CliToolArg::ReadFile => Self::ReadFile,
             CliToolArg::RunCommand => Self::RunCommand,
@@ -563,6 +572,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_tools_enable_timer_alias() {
+        let command = parse("/tools enable reminder")
+            .expect("slash command")
+            .expect("valid command");
+        assert_eq!(
+            command,
+            SlashCommand::Tools(ToolsCommand::Enable(ToolId::Timer))
+        );
+    }
+
+    #[test]
     fn parse_system_set() {
         let command = parse("/system set You are concise")
             .expect("slash command")
@@ -583,6 +603,12 @@ mod tests {
     fn complete_tool_name_after_enable() {
         let items = completions("/tools enable rea");
         assert!(items.iter().any(|item| item.label == "read-file"));
+    }
+
+    #[test]
+    fn complete_tool_name_after_enable_for_timer() {
+        let items = completions("/tools enable ti");
+        assert!(items.iter().any(|item| item.label == "timer"));
     }
 
     #[cfg(feature = "mic")]

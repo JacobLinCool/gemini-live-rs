@@ -35,6 +35,13 @@ struct SpeakerPushState {
     resampled: Vec<f32>,
 }
 
+struct SpeakerCallbackContext<'a> {
+    channels: usize,
+    device_sample_rate: u32,
+    buffer: &'a Mutex<VecDeque<f32>>,
+    aec: &'a AecHandle,
+}
+
 impl std::fmt::Debug for SpeakerPlayback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpeakerPlayback")
@@ -78,10 +85,12 @@ impl SpeakerPlayback {
                         } = &mut callback_state;
                         fill_and_feed_aec_f32(
                             data,
-                            channels,
-                            device_sample_rate,
-                            &shared_buffer,
-                            &shared_aec,
+                            SpeakerCallbackContext {
+                                channels,
+                                device_sample_rate,
+                                buffer: &shared_buffer,
+                                aec: &shared_aec,
+                            },
                             mono,
                             resampled,
                             aec_frame,
@@ -105,10 +114,12 @@ impl SpeakerPlayback {
                         output_f32.resize(data.len(), 0.0);
                         fill_and_feed_aec_f32(
                             output_f32.as_mut_slice(),
-                            channels,
-                            device_sample_rate,
-                            &shared_buffer,
-                            &shared_aec,
+                            SpeakerCallbackContext {
+                                channels,
+                                device_sample_rate,
+                                buffer: &shared_buffer,
+                                aec: &shared_aec,
+                            },
                             mono,
                             resampled,
                             aec_frame,
@@ -172,15 +183,20 @@ impl SpeakerPlayback {
 
 fn fill_and_feed_aec_f32(
     data: &mut [f32],
-    channels: usize,
-    device_sample_rate: u32,
-    buffer: &Mutex<VecDeque<f32>>,
-    aec: &AecHandle,
+    ctx: SpeakerCallbackContext<'_>,
     mono: &mut Vec<f32>,
     resampled: &mut Vec<f32>,
     aec_frame: &mut Vec<f32>,
 ) {
+    let SpeakerCallbackContext {
+        channels,
+        device_sample_rate,
+        buffer,
+        aec,
+    } = ctx;
+
     if let Ok(mut shared_buffer) = buffer.try_lock() {
+        data.fill(0.0);
         for frame in data.chunks_mut(channels) {
             let sample = shared_buffer.pop_front().unwrap_or(0.0);
             frame.fill(sample);

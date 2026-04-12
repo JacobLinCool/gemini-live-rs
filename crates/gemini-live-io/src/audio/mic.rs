@@ -42,6 +42,13 @@ struct MicCallbackState {
     aec_frame: Vec<f32>,
 }
 
+struct MicCallbackContext<'a> {
+    channels: usize,
+    input_sample_rate: u32,
+    aec: &'a AecHandle,
+    tx: &'a mpsc::Sender<CapturedAudio>,
+}
+
 impl MicCallbackState {
     fn process_f32(
         &mut self,
@@ -51,21 +58,14 @@ impl MicCallbackState {
         aec: &AecHandle,
         tx: &mpsc::Sender<CapturedAudio>,
     ) {
-        let Self {
-            input_f32: _,
-            mono,
-            resampled,
-            aec_frame,
-        } = self;
-        process_mic_samples(
+        self.process_samples(
             data,
-            channels,
-            input_sample_rate,
-            aec,
-            tx,
-            mono,
-            resampled,
-            aec_frame,
+            MicCallbackContext {
+                channels,
+                input_sample_rate,
+                aec,
+                tx,
+            },
         );
     }
 
@@ -86,14 +86,81 @@ impl MicCallbackState {
         decode_i16_to_f32_into(input_f32, data);
         process_mic_samples(
             input_f32,
-            channels,
-            input_sample_rate,
-            aec,
-            tx,
+            MicCallbackContext {
+                channels,
+                input_sample_rate,
+                aec,
+                tx,
+            },
             mono,
             resampled,
             aec_frame,
         );
+    }
+
+    fn process_samples(&mut self, data: &[f32], ctx: MicCallbackContext<'_>) {
+        let Self {
+            input_f32: _,
+            mono,
+            resampled,
+            aec_frame,
+        } = self;
+        process_mic_samples(data, ctx, mono, resampled, aec_frame);
+    }
+}
+
+fn process_mic_samples(
+    data: &[f32],
+    ctx: MicCallbackContext<'_>,
+    mono: &mut Vec<f32>,
+    resampled: &mut Vec<f32>,
+    aec_frame: &mut Vec<f32>,
+) {
+    let MicCallbackContext {
+        channels,
+        input_sample_rate,
+        aec,
+        tx,
+    } = ctx;
+
+    mono.resize(data.len() / channels, 0.0);
+    for (slot, frame) in mono.iter_mut().zip(data.chunks_exact(channels)) {
+        let mut sum = 0.0;
+        for &sample in frame {
+            sum += sample;
+        }
+        *slot = sum / channels as f32;
+    }
+
+    let aec_input = if input_sample_rate == AEC_SAMPLE_RATE {
+        mono.as_slice()
+    } else {
+        linear_resample_into(resampled, mono, input_sample_rate, AEC_SAMPLE_RATE);
+        resampled.as_slice()
+    };
+
+    aec_frame.resize(AEC_FRAME_SIZE, 0.0);
+    for chunk in aec_input.chunks(AEC_FRAME_SIZE) {
+        if chunk.len() < AEC_FRAME_SIZE {
+            break;
+        }
+
+        aec_frame.copy_from_slice(chunk);
+        if aec
+            .processor()
+            .process_capture_frame(&mut [&mut aec_frame[..]])
+            .is_err()
+        {
+            continue;
+        }
+
+        let pcm_i16_le = encode_f32_to_pcm_i16le(aec_frame);
+
+        tx.try_send(CapturedAudio {
+            pcm_i16_le,
+            sample_rate: AEC_SAMPLE_RATE,
+        })
+        .ok();
     }
 }
 
@@ -154,57 +221,6 @@ impl MicCapture {
             input_sample_rate,
             output_sample_rate: AEC_SAMPLE_RATE,
         })
-    }
-}
-
-fn process_mic_samples(
-    data: &[f32],
-    channels: usize,
-    input_sample_rate: u32,
-    aec: &AecHandle,
-    tx: &mpsc::Sender<CapturedAudio>,
-    mono: &mut Vec<f32>,
-    resampled: &mut Vec<f32>,
-    aec_frame: &mut Vec<f32>,
-) {
-    mono.resize(data.len() / channels, 0.0);
-    for (slot, frame) in mono.iter_mut().zip(data.chunks_exact(channels)) {
-        let mut sum = 0.0;
-        for &sample in frame {
-            sum += sample;
-        }
-        *slot = sum / channels as f32;
-    }
-
-    let aec_input = if input_sample_rate == AEC_SAMPLE_RATE {
-        mono.as_slice()
-    } else {
-        linear_resample_into(resampled, mono, input_sample_rate, AEC_SAMPLE_RATE);
-        resampled.as_slice()
-    };
-
-    aec_frame.resize(AEC_FRAME_SIZE, 0.0);
-    for chunk in aec_input.chunks(AEC_FRAME_SIZE) {
-        if chunk.len() < AEC_FRAME_SIZE {
-            break;
-        }
-
-        aec_frame.copy_from_slice(chunk);
-        if aec
-            .processor()
-            .process_capture_frame(&mut [&mut aec_frame[..]])
-            .is_err()
-        {
-            continue;
-        }
-
-        let pcm_i16_le = encode_f32_to_pcm_i16le(aec_frame);
-
-        tx.try_send(CapturedAudio {
-            pcm_i16_le,
-            sample_rate: AEC_SAMPLE_RATE,
-        })
-        .ok();
     }
 }
 

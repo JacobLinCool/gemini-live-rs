@@ -8,11 +8,11 @@ license = "MIT"
 repository = "https://github.com/jacoblincool/gemini-live-rs"
 
 [workspace.dependencies]
-gemini-live = { path = "crates/gemini-live", version = "0.1.7" }
-gemini-live-harness = { path = "crates/gemini-live-harness", version = "0.1.7" }
-gemini-live-io = { path = "crates/gemini-live-io", version = "0.1.7" }
-gemini-live-runtime = { path = "crates/gemini-live-runtime", version = "0.1.7" }
-gemini-live-tools = { path = "crates/gemini-live-tools", version = "0.1.7" }
+gemini-live = { path = "crates/gemini-live", version = "0.1.8" }
+gemini-live-harness = { path = "crates/gemini-live-harness", version = "0.1.8" }
+gemini-live-io = { path = "crates/gemini-live-io", version = "0.1.8" }
+gemini-live-runtime = { path = "crates/gemini-live-runtime", version = "0.1.8" }
+gemini-live-tools = { path = "crates/gemini-live-tools", version = "0.1.8" }
 
 tokio = { version = "1.51", features = ["full"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }

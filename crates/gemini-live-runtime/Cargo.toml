@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live-runtime"
-version = "0.1.7"
+version = "0.1.8"
 description = "Reusable runtime orchestration for Gemini Live applications"
 readme = "README.md"
 edition.workspace = true

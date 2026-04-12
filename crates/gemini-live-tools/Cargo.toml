@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live-tools"
-version = "0.1.7"
+version = "0.1.8"
 description = "Reusable tool families for Gemini Live hosts"
 readme = "../../README.md"
 edition.workspace = true

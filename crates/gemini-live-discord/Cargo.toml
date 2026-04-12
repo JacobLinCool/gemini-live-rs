@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live-discord"
-version = "0.1.7"
+version = "0.1.8"
 description = "Discord voice and text host for Gemini Live"
 readme = "README.md"
 edition.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live-harness"
-version = "0.1.7"
+version = "0.1.8"
 description = "Durable file-backed harness state and tools for Gemini Live hosts"
 readme = "README.md"
 edition.workspace = true

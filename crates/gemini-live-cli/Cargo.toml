@@ -1,6 +1,6 @@
 [package]
 name = "gemini-live-cli"
-version = "0.1.7"
+version = "0.1.8"
 description = "CLI tool for Gemini Live API"
 readme = "../../README.md"
 edition.workspace = true

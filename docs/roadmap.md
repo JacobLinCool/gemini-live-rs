@@ -8,15 +8,21 @@
 
 ## Performance
 
-Items from the "maximum performance" goal (see `design.md`).
+There are currently no open protocol-layer performance items. New entries
+should be added here only when a measured regression or newly identified
+structural inefficiency is still unresolved.
 
-| ID | Item | Description | Severity |
-|----|------|-------------|----------|
-| P-1 | `send_audio` / `send_video` per-call allocation | `Session::send_audio` calls `STANDARD.encode()` allocating a new `String` every chunk instead of reusing `AudioEncoder`'s buffer. Workaround: use `AudioEncoder` + `send_raw`. | Medium |
-| P-2 | `codec::encode` per-call allocation | `serde_json::to_string` allocates a new `String` per call. Should offer `encode_into(&mut Vec<u8>)` writing into a reusable buffer. | Medium |
-| P-3 | `codec::into_events` audio decode allocation | base64 decoding audio data allocates a new `Vec<u8>`. Consider decode-in-place or caller-provided buffer. | Low |
-| P-4 | `ServerEvent::ModelAudio` clone cost | Holds `Vec<u8>`; broadcast channel clones the entire buffer on send. Switch to `bytes::Bytes` (ref-counted, O(1) clone). | Medium |
-| P-5 | Benchmark baselines and CI gating | Criterion benchmarks now exist in `crates/gemini-live/benches/hot_path.rs`, but there are no checked-in baselines, regression thresholds, or CI reporting. We still cannot prove whether perf changes help or hurt over time. | Medium |
+## Done
+
+| ID | Item | Date | Notes |
+|----|------|------|-------|
+| P-3 | `codec::into_events` audio decode allocation | 2026-04-12 | Split server-side model turns away from the client `Blob` type and decode inline audio during deserialization into `Bytes`. This removes one owned base64-audio buffer from the recv path; pure decomposition work is much cheaper, while end-to-end recv latency stays roughly flat because the decode work now happens earlier in `codec::decode`. |
+| P-1 | `send_audio` / `send_video` per-call allocation | 2026-04-12 | Moved audio/video convenience sends onto dedicated runner commands with reusable base64 / MIME / JSON buffers, eliminating the per-chunk base64 `String` allocation from `send_audio` and the common JPEG/PNG MIME allocation from `send_video`. |
+| P-2 | `codec::encode` per-call allocation | 2026-04-12 | Added `codec::encode_into(&mut Vec<u8>)` and moved the session runner plus setup handshake onto reusable JSON buffers, removing the `serde_json::to_string` allocation from the hot send path. |
+| P-5 | Benchmark baselines and idle regression coverage | 2026-04-12 | Added checked-in Criterion baselines for `gemini-live-runtime` and `gemini-live-harness`, plus deterministic regression tests for idle timeout boundaries and signal-driven notification wake behavior. |
+| P-6 | Desktop audio callback allocations | 2026-04-12 | Reworked `gemini-live-io` mic/speaker adapters around reusable scratch buffers and in-place resampling, eliminating steady-state callback allocations on the speaker path and removing most transient mic callback heap traffic. |
+| P-4 | `ServerEvent::ModelAudio` clone cost | 2026-04-12 | Switched model-audio events to `bytes::Bytes`, so runtime fanout now clones payload handles instead of copying PCM buffers. |
+| F-10 | Harness host lifecycle parity | 2026-04-12 | The CLI now uses `SessionManager` like Discord does, so wake / resume / dormant transitions and passive-notification wake semantics no longer depend on a permanently hot desktop session. |
 
 ## Features
 
@@ -33,7 +39,6 @@ Missing or incomplete functionality relative to the upstream API.
 | F-7 | Broader built-in Live tools | Typed `googleSearch` setup coverage now exists. Extend the typed tool surface to the remaining built-in tools the Live API exposes on supported models/endpoints, instead of forcing callers into raw JSON. | Medium |
 | F-8 | Gemini 2.5-only session features | `enableAffectiveDialog` and `proactivity.proactiveAudio` are explicit Live API capabilities on Gemini 2.5 (`v1alpha`). Audit and add missing typed coverage. | Medium |
 | F-9 | Async function-calling wire semantics audit | Official docs put `behavior=NON_BLOCKING` on function declarations and `scheduling` inside `FunctionResponse.response`. Audit our types and examples against the current wire contract. | High |
-| F-10 | Harness host lifecycle parity | CLI and Discord now both use `gemini-live-harness` for durable profiles, background tasks, and passive notifications. The remaining work is to keep wake/dormancy behavior, startup reconciliation, and passive-notification delivery semantics aligned across hosts so future hosts do not drift back into bespoke orchestration paths. | Medium |
 | F-12 | Harness notification source metadata | Durable notifications still do not record structured origin metadata such as `source_kind`, `source_id`, or a future dedupe key. Add at least source identity fields so prompt formatting, debugging, and later de-duplication do not rely on free-form notification text alone. | Medium |
 
 ## CLI Product

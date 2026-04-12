@@ -7,15 +7,13 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::error::HarnessError;
 use crate::notification::{HarnessNotification, NotificationStatus};
 use crate::store::Harness;
-
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One queued passive notification that should be injected into the model.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,24 +26,16 @@ pub struct PassiveNotificationDelivery {
 #[derive(Debug, Clone)]
 pub struct PassiveNotificationPump {
     harness: Harness,
-    interval: Duration,
     in_flight_notification_id: Arc<Mutex<Option<String>>>,
+    delivery_gate_notify: Arc<Notify>,
 }
 
 impl PassiveNotificationPump {
     pub fn new(harness: Harness) -> Self {
         Self {
             harness,
-            interval: DEFAULT_INTERVAL,
             in_flight_notification_id: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn with_interval(harness: Harness, interval: Duration) -> Self {
-        Self {
-            harness,
-            interval,
-            in_flight_notification_id: Arc::new(Mutex::new(None)),
+            delivery_gate_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -53,15 +43,19 @@ impl PassiveNotificationPump {
         &self.harness
     }
 
-    pub fn interval(&self) -> Duration {
-        self.interval
-    }
-
     pub fn current_in_flight_notification_id(&self) -> Option<String> {
         self.in_flight_notification_id
             .lock()
             .expect("notification pump in-flight lock")
             .clone()
+    }
+
+    pub fn queue_version(&self) -> u64 {
+        self.harness.notification_signal().current_version()
+    }
+
+    pub fn notify_delivery_gate_changed(&self) {
+        self.delivery_gate_notify.notify_waiters();
     }
 
     /// Requeue any notification left in `delivered` state by an interrupted
@@ -106,10 +100,11 @@ impl PassiveNotificationPump {
     {
         let pump = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(pump.interval);
+            let mut observed_queue_version = pump.queue_version();
             loop {
-                interval.tick().await;
                 if !can_deliver().await {
+                    pump.wait_for_signal_since(observed_queue_version).await;
+                    observed_queue_version = pump.queue_version();
                     continue;
                 }
                 match pump.dispatch_once(&deliver).await {
@@ -118,13 +113,26 @@ impl PassiveNotificationPump {
                         tracing::warn!("passive harness notification dispatch failed: {error}")
                     }
                 }
+                observed_queue_version = pump.queue_version();
+                pump.wait_for_signal_since(observed_queue_version).await;
+                observed_queue_version = pump.queue_version();
             }
         })
     }
 
-    pub async fn dispatch_once<D, DFut, E>(&self, deliver: &D) -> Result<(), HarnessError>
+    pub async fn wait_for_signal_since(&self, observed_queue_version: u64) {
+        let signal = self.harness.notification_signal();
+        let queue_change = signal.wait_for_queue_change_since(observed_queue_version);
+        let gate_change = self.delivery_gate_notify.notified();
+        tokio::select! {
+            _ = queue_change => {}
+            _ = gate_change => {}
+        }
+    }
+
+    pub async fn dispatch_once<D, DFut, E>(&self, deliver: D) -> Result<(), HarnessError>
     where
-        D: Fn(PassiveNotificationDelivery) -> DFut + Send + Sync,
+        D: FnOnce(PassiveNotificationDelivery) -> DFut + Send,
         DFut: Future<Output = Result<(), E>> + Send,
         E: std::fmt::Display + Send,
     {
@@ -198,6 +206,8 @@ pub fn format_passive_notification_prompt(notification: &HarnessNotification) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -260,5 +270,118 @@ mod tests {
             .expect("recover deliveries");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].status, NotificationStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn queue_signal_wakes_waiter_after_enqueue() {
+        let harness = temp_harness();
+        let pump = PassiveNotificationPump::new(harness.clone());
+        let observed_version = pump.queue_version();
+
+        let waiter = tokio::spawn({
+            let pump = pump.clone();
+            async move {
+                pump.wait_for_signal_since(observed_version).await;
+            }
+        });
+
+        harness
+            .enqueue_notification(NewNotification {
+                kind: NotificationKind::Generic,
+                task_id: None,
+                title: "Ping".into(),
+                body: "Hello".into(),
+                payload: None,
+            })
+            .expect("enqueue");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("queue signal wake timeout")
+            .expect("queue signal task");
+    }
+
+    #[tokio::test]
+    async fn waiter_stays_blocked_without_queue_or_gate_signal() {
+        let harness = temp_harness();
+        let pump = PassiveNotificationPump::new(harness);
+        let observed_version = pump.queue_version();
+        let woke = Arc::new(AtomicBool::new(false));
+
+        let waiter = tokio::spawn({
+            let pump = pump.clone();
+            let woke = Arc::clone(&woke);
+            async move {
+                pump.wait_for_signal_since(observed_version).await;
+                woke.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!woke.load(Ordering::SeqCst));
+
+        pump.notify_delivery_gate_changed();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("gate wake timeout")
+            .expect("waiter task");
+        assert!(woke.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn gate_signal_delivers_without_interval_polling() {
+        let harness = temp_harness();
+        let controller = Arc::new(PassiveNotificationPump::new(harness.clone()));
+        let gate_open = Arc::new(AtomicBool::new(false));
+        let delivery_count = Arc::new(AtomicUsize::new(0));
+
+        harness
+            .enqueue_notification(NewNotification {
+                kind: NotificationKind::Generic,
+                task_id: None,
+                title: "Ping".into(),
+                body: "Hello".into(),
+                payload: None,
+            })
+            .expect("enqueue");
+
+        let task = controller.spawn(
+            {
+                let gate_open = Arc::clone(&gate_open);
+                move || {
+                    let gate_open = Arc::clone(&gate_open);
+                    async move { gate_open.load(Ordering::SeqCst) }
+                }
+            },
+            {
+                let delivery_count = Arc::clone(&delivery_count);
+                move |_delivery| {
+                    let delivery_count = Arc::clone(&delivery_count);
+                    async move {
+                        delivery_count.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), String>(())
+                    }
+                }
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(delivery_count.load(Ordering::SeqCst), 0);
+
+        gate_open.store(true, Ordering::SeqCst);
+        controller.notify_delivery_gate_changed();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if delivery_count.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delivery after gate signal");
+
+        task.abort();
     }
 }

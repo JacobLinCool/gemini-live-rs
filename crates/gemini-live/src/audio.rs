@@ -42,9 +42,11 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 24_000;
 ///
 /// # Performance
 ///
-/// For maximum throughput, keep a single `AudioEncoder` instance alive across
-/// the streaming loop and pair it with [`Session::send_raw`](crate::session::Session::send_raw)
-/// to avoid the extra allocation in [`Session::send_audio`](crate::session::Session::send_audio).
+/// Keep a single `AudioEncoder` instance alive across a streaming loop when
+/// you need reusable PCM → base64 conversion for custom payload assembly.
+/// [`Session::send_audio`](crate::session::Session::send_audio) now keeps its
+/// own runner-side encoder state, so callers no longer need `AudioEncoder`
+/// just to avoid per-chunk base64 allocation.
 ///
 /// ```rust,no_run
 /// # use gemini_live::audio::{AudioEncoder, INPUT_AUDIO_MIME};
@@ -53,7 +55,8 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 24_000;
 /// let mut enc = AudioEncoder::new();
 /// // In a streaming loop:
 /// let b64 = enc.encode_i16_le(pcm_bytes);
-/// // Build the message — only the to_owned() here allocates:
+/// // Build the message — the to_owned() here is still required because the
+/// // public wire types own their payload strings.
 /// let msg = ClientMessage::RealtimeInput(RealtimeInput {
 ///     audio: Some(Blob { data: b64.to_owned(), mime_type: INPUT_AUDIO_MIME.into() }),
 ///     video: None, text: None, activity_start: None, activity_end: None,

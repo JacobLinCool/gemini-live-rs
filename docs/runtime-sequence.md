@@ -268,7 +268,8 @@ sequenceDiagram
 ## Implementation Notes
 
 - Cancellation is best-effort. `ToolExecutor::cancel()` may simply return `false`, and the harness fallback is to abort its own in-process execution future and, when a background task already exists, mark that durable task cancelled.
-- The full `SessionManager` wake / resume / rehydrate branch is the Discord-style host path. The CLI currently uses `ManagedRuntime` directly, connects once at startup, and stays hot until exit.
+- Discord and the CLI now both use `SessionManager` for wake / resume / rehydrate / dormancy. The CLI starts dormant, wakes on user input, media activity, tool completions, or passive notifications, and returns to dormant after its idle gate clears.
+- Passive notification delivery is signal-driven inside one host process: queue mutations wake the pump immediately, and hosts separately signal gate changes when a session becomes interruptible. Idle hosts do not rely on fixed notification polling intervals anymore.
 - Notification ordering is newest-first, not FIFO. The pump calls `list_notifications(status = queued, limit = 1)`, and the store sorts by `updated_at_ms` descending then `id` ascending.
 - Session resumption fallback lives in `SessionManager::ensure_hot()`, not inside `ManagedRuntime::connect_resumed()`. When there is no usable handle, or a resumed connect fails, the manager explicitly falls back to `connect()` or `connect_with_setup_override(...)` plus rehydration.
 - There is currently no semantic dedup for repeated model tool calls. Two logically identical calls become two independent background tasks if they both time out.

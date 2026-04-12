@@ -31,11 +31,14 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{fmt::Write as _, sync::Arc as StdArc};
 
 use base64::Engine;
+use bytes::Bytes;
 use futures_util::Stream;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::audio::{AudioEncoder, INPUT_AUDIO_MIME, INPUT_SAMPLE_RATE};
 use crate::codec;
 use crate::error::SessionError;
 use crate::transport::{Connection, RawFrame, TransportConfig};
@@ -166,6 +169,10 @@ impl Session {
             conn,
             config,
             state: Arc::clone(&state),
+            audio_encoder: AudioEncoder::new(),
+            audio_mime_buf: String::with_capacity(INPUT_AUDIO_MIME.len() + 16),
+            video_b64_buf: String::with_capacity(128 * 1024),
+            send_json_buf: Vec::with_capacity(16 * 1024),
         };
         tokio::spawn(runner.run());
 
@@ -188,12 +195,13 @@ impl Session {
     /// Stream audio.  Accepts raw i16 little-endian PCM bytes — base64
     /// encoding and `realtimeInput` wrapping are handled internally.
     ///
-    /// **Performance note:** allocates a new `String` for base64 on every
-    /// call (`roadmap.md` P-1).  For zero-allocation streaming, use
-    /// [`AudioEncoder`](crate::audio::AudioEncoder) with [`send_raw`](Self::send_raw).
+    /// Uses the session runner's reusable base64 and JSON buffers, so the hot
+    /// streaming path no longer allocates a fresh base64 `String` per chunk.
+    ///
+    /// Each call still copies the raw PCM bytes into the runner command queue
+    /// so the background task can own them safely.
     pub async fn send_audio(&self, pcm_i16_le: &[u8]) -> Result<(), SessionError> {
-        self.send_audio_at_rate(pcm_i16_le, crate::audio::INPUT_SAMPLE_RATE)
-            .await
+        self.send_audio_at_rate(pcm_i16_le, INPUT_SAMPLE_RATE).await
     }
 
     /// Stream audio at a specific sample rate.
@@ -202,36 +210,30 @@ impl Session {
     /// rate (e.g. for mic capture at the device's native rate).  The server
     /// resamples as needed.
     ///
-    /// **Performance note:** allocates a new `String` for base64 on every
-    /// call (`roadmap.md` P-1).  For zero-allocation streaming, use
-    /// [`AudioEncoder`](crate::audio::AudioEncoder) with [`send_raw`](Self::send_raw).
+    /// Reuses the runner's base64, MIME, and JSON buffers; only the raw PCM
+    /// command payload itself is copied into the queue.
     pub async fn send_audio_at_rate(
         &self,
         pcm_i16_le: &[u8],
         sample_rate: u32,
     ) -> Result<(), SessionError> {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(pcm_i16_le);
-        let mime = format!("audio/pcm;rate={sample_rate}");
-        self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
-            audio: Some(Blob {
-                data: b64,
-                mime_type: mime,
-            }),
-            ..Default::default()
-        }))
+        self.send_command(Command::SendAudio {
+            pcm: Bytes::copy_from_slice(pcm_i16_le),
+            sample_rate,
+        })
         .await
     }
 
     /// Stream a video frame.  Accepts encoded JPEG/PNG bytes.
+    ///
+    /// The runner reuses its base64 and JSON buffers. The frame bytes and MIME
+    /// string are still copied into the command queue so the background task
+    /// can own them safely.
     pub async fn send_video(&self, data: &[u8], mime: &str) -> Result<(), SessionError> {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-        self.send_raw(ClientMessage::RealtimeInput(RealtimeInput {
-            video: Some(Blob {
-                data: b64,
-                mime_type: mime.into(),
-            }),
-            ..Default::default()
-        }))
+        self.send_command(Command::SendVideo {
+            data: Bytes::copy_from_slice(data),
+            mime_type: VideoMimeType::from_input(mime),
+        })
         .await
     }
 
@@ -289,10 +291,7 @@ impl Session {
 
     /// Send an arbitrary [`ClientMessage`] (escape hatch for future types).
     pub async fn send_raw(&self, msg: ClientMessage) -> Result<(), SessionError> {
-        self.cmd_tx
-            .send(Command::Send(Box::new(msg)))
-            .await
-            .map_err(|_| SessionError::Closed)
+        self.send_command(Command::Send(Box::new(msg))).await
     }
 
     // ── Receive ──────────────────────────────────────────────────────
@@ -359,13 +358,52 @@ impl Session {
         let _ = self.cmd_tx.send(Command::Close).await;
         Ok(())
     }
+
+    async fn send_command(&self, cmd: Command) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
 }
 
 // ── Internals ──────────────────────────────��─────────────────────────────────
 
 enum Command {
     Send(Box<ClientMessage>),
+    SendAudio {
+        pcm: Bytes,
+        sample_rate: u32,
+    },
+    SendVideo {
+        data: Bytes,
+        mime_type: VideoMimeType,
+    },
     Close,
+}
+
+enum VideoMimeType {
+    Jpeg,
+    Png,
+    Other(StdArc<str>),
+}
+
+impl VideoMimeType {
+    fn from_input(mime: &str) -> Self {
+        match mime {
+            "image/jpeg" => Self::Jpeg,
+            "image/png" => Self::Png,
+            _ => Self::Other(StdArc::<str>::from(mime)),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Other(mime) => mime,
+        }
+    }
 }
 
 // ── Shared state (survives reconnects) ─────────────────────────────���─────────
@@ -420,6 +458,10 @@ struct Runner {
     conn: Connection,
     config: SessionConfig,
     state: Arc<SharedState>,
+    audio_encoder: AudioEncoder,
+    audio_mime_buf: String,
+    video_b64_buf: String,
+    send_json_buf: Vec<u8>,
 }
 
 impl Runner {
@@ -472,15 +514,63 @@ impl Runner {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(Command::Send(msg)) => { let msg = *msg;
-                            match codec::encode(&msg) {
-                                Ok(json) => {
-                                    if let Err(e) = self.conn.send_text(&json).await {
+                            match codec::encode_into(&mut self.send_json_buf, &msg) {
+                                Ok(()) => {
+                                    if let Err(e) = self.conn.send_json_bytes(&self.send_json_buf).await {
                                         tracing::warn!(error = %e, "send failed");
                                         return DisconnectReason::ConnectionLost;
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "message encode failed, dropping");
+                                }
+                            }
+                        }
+                        Some(Command::SendAudio { pcm, sample_rate }) => {
+                            let (audio_encoder, audio_mime_buf, send_json_buf) = (
+                                &mut self.audio_encoder,
+                                &mut self.audio_mime_buf,
+                                &mut self.send_json_buf,
+                            );
+                            let b64 = audio_encoder.encode_i16_le(&pcm);
+                            let mime = audio_mime_for_rate(sample_rate, audio_mime_buf);
+                            match codec::encode_realtime_input_blob_into(
+                                send_json_buf,
+                                codec::RealtimeInputBlobKind::Audio,
+                                mime,
+                                b64,
+                            ) {
+                                Ok(()) => {
+                                    if let Err(e) = self.conn.send_json_bytes(&self.send_json_buf).await {
+                                        tracing::warn!(error = %e, "send failed");
+                                        return DisconnectReason::ConnectionLost;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "audio command encode failed, dropping");
+                                }
+                            }
+                        }
+                        Some(Command::SendVideo { data, mime_type }) => {
+                            let (video_b64_buf, send_json_buf) =
+                                (&mut self.video_b64_buf, &mut self.send_json_buf);
+                            video_b64_buf.clear();
+                            base64::engine::general_purpose::STANDARD
+                                .encode_string(&data, video_b64_buf);
+                            match codec::encode_realtime_input_blob_into(
+                                send_json_buf,
+                                codec::RealtimeInputBlobKind::Video,
+                                mime_type.as_str(),
+                                video_b64_buf,
+                            ) {
+                                Ok(()) => {
+                                    if let Err(e) = self.conn.send_json_bytes(&self.send_json_buf).await {
+                                        tracing::warn!(error = %e, "send failed");
+                                        return DisconnectReason::ConnectionLost;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "video command encode failed, dropping");
                                 }
                             }
                         }
@@ -599,6 +689,16 @@ impl Runner {
     }
 }
 
+fn audio_mime_for_rate(sample_rate: u32, mime_buf: &mut String) -> &str {
+    if sample_rate == INPUT_SAMPLE_RATE {
+        INPUT_AUDIO_MIME
+    } else {
+        mime_buf.clear();
+        write!(mime_buf, "audio/pcm;rate={sample_rate}").expect("write! into String cannot fail");
+        mime_buf.as_str()
+    }
+}
+
 // ── Handshake ────────────────────────────────────────────────────────────────
 
 /// Send `setup` and wait for `setupComplete`.
@@ -611,10 +711,10 @@ async fn do_handshake(
     resume_handle: Option<String>,
 ) -> Result<(), SessionError> {
     let setup = setup_for_handshake(setup, resume_handle);
-
-    let json = codec::encode(&ClientMessage::Setup(setup))?;
-    tracing::debug!(setup_json = %json, "sending setup message");
-    conn.send_text(&json)
+    let mut json = Vec::with_capacity(4096);
+    codec::encode_into(&mut json, &ClientMessage::Setup(setup))?;
+    tracing::debug!(setup_json = %String::from_utf8_lossy(&json), "sending setup message");
+    conn.send_json_bytes(&json)
         .await
         .map_err(|e| SessionError::SetupFailed(format_error_chain(&e)))?;
 

@@ -4,9 +4,9 @@
 //! [Gemini Multimodal Live API](https://ai.google.dev/api/live).
 //!
 //! Designed for real-time audio/video streaming where every allocation
-//! counts.  See [`audio::AudioEncoder`] for the zero-allocation hot path,
+//! counts.  See [`audio::AudioEncoder`] for reusable PCM → base64 encoding,
 //! `docs/design.md` for performance goals, and `docs/roadmap.md` for
-//! known gaps and planned work.
+//! the remaining gaps and planned work.
 //!
 //! ## Architecture
 //!

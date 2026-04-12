@@ -13,8 +13,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use bytes::Bytes;
 use gemini_live::ServerEvent;
 use gemini_live::types::{Content, FunctionResponse, Part};
 use gemini_live_harness::{Harness, HarnessToolCompletionDisposition, PassiveNotificationDelivery};
@@ -32,7 +33,7 @@ use serenity::builder::CreateBotAuthParameters;
 use serenity::http::Http;
 use songbird::driver::{Channels, DecodeConfig, DecodeMode, SampleRate};
 use songbird::serenity::{SerenityInit, get as get_songbird};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::config::{DiscordBotConfig, harness_profile_name};
@@ -113,8 +114,8 @@ struct SharedBotStateInner {
     pending_text_replies: Mutex<VecDeque<PendingTextReply>>,
     turn_in_flight: Mutex<bool>,
     voice_bridge: Mutex<Option<ActiveVoiceBridge>>,
+    idle_state_changed: Notify,
 }
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTextReply {
@@ -232,8 +233,23 @@ impl SharedBotState {
                 pending_text_replies: Mutex::new(VecDeque::new()),
                 turn_in_flight: Mutex::new(false),
                 voice_bridge: Mutex::new(None),
+                idle_state_changed: Notify::new(),
             }),
         }
+    }
+
+    fn note_idle_state_changed(&self) {
+        self.inner.idle_state_changed.notify_waiters();
+    }
+
+    fn note_passive_notification_gate_changed(&self) {
+        self.inner
+            .harness_controller
+            .notify_passive_notification_gate_changed();
+    }
+
+    async fn wait_for_idle_state_change(&self) {
+        self.inner.idle_state_changed.notified().await;
     }
 
     fn config(&self) -> &DiscordBotConfig {
@@ -263,6 +279,8 @@ impl SharedBotState {
                 let mut state = self.inner.service_state.write().await;
                 state.target_channel_id = Some(channel.id);
                 state.setup_error = None;
+                drop(state);
+                self.note_passive_notification_gate_changed();
                 Ok(channel.id)
             }
             Err(error) => {
@@ -329,6 +347,8 @@ impl SharedBotState {
 
     async fn set_turn_in_flight(&self, value: bool) {
         *self.inner.turn_in_flight.lock().await = value;
+        self.note_idle_state_changed();
+        self.note_passive_notification_gate_changed();
     }
 
     async fn sync_turn_state_after_reply_end(&self) {
@@ -381,6 +401,8 @@ impl SharedBotState {
 
         let mut state = self.inner.service_state.write().await;
         state.joined_voice_channel_id = Some(target_channel_id);
+        drop(state);
+        self.note_idle_state_changed();
         Ok(())
     }
 
@@ -392,10 +414,12 @@ impl SharedBotState {
 
         let mut state = self.inner.service_state.write().await;
         state.joined_voice_channel_id = None;
+        drop(state);
+        self.note_idle_state_changed();
         Ok(())
     }
 
-    async fn push_model_audio(&self, pcm_i16_le_24k: Vec<u8>) -> Result<(), DiscordServiceError> {
+    async fn push_model_audio(&self, pcm_i16_le_24k: Bytes) -> Result<(), DiscordServiceError> {
         let guard = self.inner.voice_bridge.lock().await;
         if let Some(bridge) = guard.as_ref() {
             bridge.push_model_audio(pcm_i16_le_24k).await?;
@@ -439,6 +463,8 @@ impl SharedBotState {
     async fn record_runtime_activity(&self, kind: ActivityKind, at: Instant) {
         let session_manager = self.inner.session_manager.lock().await;
         session_manager.record_activity(kind, at);
+        drop(session_manager);
+        self.note_idle_state_changed();
     }
 
     async fn record_completed_turn(&self, turn: &CompletedTurn) {
@@ -455,6 +481,9 @@ impl SharedBotState {
         if self.inner.voice_bridge.lock().await.is_some() {
             return Ok(());
         }
+        if self.is_turn_in_flight().await {
+            return Ok(());
+        }
 
         let mut session_manager = self.inner.session_manager.lock().await;
         if session_manager.lifecycle_state() == SessionLifecycleState::Dormant {
@@ -462,8 +491,32 @@ impl SharedBotState {
         }
         if session_manager.idle_decision(now) == gemini_live_runtime::IdleDecision::EnterDormant {
             session_manager.enter_dormant().await?;
+            drop(session_manager);
+            self.note_idle_state_changed();
         }
         Ok(())
+    }
+
+    async fn next_idle_deadline(&self) -> Option<Instant> {
+        if self.inner.voice_bridge.lock().await.is_some() {
+            return None;
+        }
+        if self.is_turn_in_flight().await {
+            return None;
+        }
+
+        let session_manager = self.inner.session_manager.lock().await;
+        if session_manager.lifecycle_state() == SessionLifecycleState::Dormant {
+            return None;
+        }
+
+        let snapshot = session_manager.snapshot();
+        Some(
+            snapshot
+                .last_activity_at
+                .map(|at| at + session_manager.idle_policy().idle_timeout)
+                .unwrap_or_else(Instant::now),
+        )
     }
 
     fn recover_orphaned_notification_deliveries(&self) -> Result<usize, DiscordServiceError> {
@@ -946,11 +999,20 @@ async fn ensure_active_reply(
 
 fn spawn_idle_dormancy_loop(state: SharedBotState) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
         loop {
-            interval.tick().await;
-            if let Err(error) = state.maybe_enter_dormant_if_idle(Instant::now()).await {
-                tracing::warn!("idle dormancy evaluation failed: {error}");
+            if let Some(deadline) = state.next_idle_deadline().await {
+                let sleep = tokio::time::sleep(deadline.saturating_duration_since(Instant::now()));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = &mut sleep => {
+                        if let Err(error) = state.maybe_enter_dormant_if_idle(Instant::now()).await {
+                            tracing::warn!("idle dormancy evaluation failed: {error}");
+                        }
+                    }
+                    _ = state.wait_for_idle_state_change() => {}
+                }
+            } else {
+                state.wait_for_idle_state_change().await;
             }
         }
     })
@@ -1102,7 +1164,7 @@ mod tests {
             thinking_level: gemini_live::types::ThinkingLevel::High,
             system_instruction: DEFAULT_DISCORD_SYSTEM_INSTRUCTION.into(),
             voice_name: None,
-            idle_timeout: Duration::from_secs(90),
+            idle_timeout: std::time::Duration::from_secs(90),
             max_recent_turns: 24,
         }
     }

@@ -16,8 +16,8 @@ use gemini_live_io::audio::SpeakerPlayback;
 use gemini_live_io::audio::{CapturedAudio, MicCapture};
 #[cfg(feature = "share-screen")]
 use gemini_live_io::screen::{EncodedFrame, ScreenCapture, ScreenCaptureConfig, list_targets};
-#[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
-use gemini_live_runtime::{GeminiSessionDriver, ManagedRuntime};
+#[cfg(any(feature = "mic", feature = "share-screen"))]
+use gemini_live_runtime::{RuntimeSession, WakeReason};
 #[cfg(any(feature = "mic", feature = "share-screen"))]
 use tokio::sync::mpsc;
 
@@ -33,9 +33,9 @@ use crate::desktop_control::{
 #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
 use crate::profile;
 #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
-use crate::startup::StartupConfig;
+use crate::session::{CliSessionManager, audio_stream_end_if_hot, ensure_hot_session};
 #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
-type CliRuntime = ManagedRuntime<GeminiSessionDriver>;
+use crate::startup::StartupConfig;
 
 #[cfg(any(feature = "mic", feature = "speak"))]
 pub(crate) struct DesktopAudio {
@@ -74,10 +74,10 @@ impl DesktopAudio {
         startup: &StartupConfig,
         app: &mut App,
         store: &mut profile::ProfileStore,
-        runtime: &CliRuntime,
+        session_manager: &CliSessionManager,
     ) -> io::Result<()> {
         #[cfg(not(feature = "mic"))]
-        let _ = runtime;
+        let _ = session_manager;
 
         #[cfg(feature = "speak")]
         if startup.speak_enabled {
@@ -87,7 +87,7 @@ impl DesktopAudio {
 
         #[cfg(feature = "mic")]
         if startup.mic_enabled {
-            let _ = self.set_mic_enabled(true, app, runtime).await;
+            let _ = self.set_mic_enabled(true, app, session_manager).await;
             persist_audio_state(store, app)?;
         }
 
@@ -99,13 +99,13 @@ impl DesktopAudio {
         command: &AppCommand,
         app: &mut App,
         store: &mut profile::ProfileStore,
-        runtime: &CliRuntime,
+        session_manager: &CliSessionManager,
     ) -> io::Result<bool> {
         match command {
             #[cfg(feature = "mic")]
             AppCommand::ToggleMic => {
                 let _ = self
-                    .set_mic_enabled(!self.mic_enabled(), app, runtime)
+                    .set_mic_enabled(!self.mic_enabled(), app, session_manager)
                     .await;
                 persist_audio_state(store, app)?;
                 Ok(true)
@@ -126,8 +126,16 @@ impl DesktopAudio {
     }
 
     #[cfg(feature = "mic")]
-    pub(crate) async fn forward_captured(&self, captured: CapturedAudio, runtime: &CliRuntime) {
-        let _ = runtime
+    pub(crate) async fn forward_captured(
+        &self,
+        captured: CapturedAudio,
+        session_manager: &mut CliSessionManager,
+    ) {
+        let Ok(session) = ensure_hot_session(session_manager, WakeReason::VoiceActivity).await
+        else {
+            return;
+        };
+        let _ = session
             .send_audio_at_rate(&captured.pcm_i16_le, captured.sample_rate)
             .await;
     }
@@ -160,7 +168,7 @@ impl DesktopAudio {
         &mut self,
         enabled: bool,
         app: &mut App,
-        runtime: &CliRuntime,
+        session_manager: &CliSessionManager,
     ) -> Result<bool, DesktopControlError> {
         if self.mic_enabled() == enabled {
             return Ok(false);
@@ -170,7 +178,7 @@ impl DesktopAudio {
             self.mic = None;
             app.mic_on = false;
             app.sys("mic off".into());
-            let _ = runtime.audio_stream_end().await;
+            let _ = audio_stream_end_if_hot(session_manager).await;
             return Ok(true);
         }
 
@@ -338,8 +346,16 @@ impl DesktopScreen {
         self.screen_rx.recv().await
     }
 
-    pub(crate) async fn forward_frame(&self, frame: EncodedFrame, runtime: &CliRuntime) {
-        let _ = runtime.send_video(&frame.bytes, frame.mime_type).await;
+    pub(crate) async fn forward_frame(
+        &self,
+        frame: EncodedFrame,
+        session_manager: &mut CliSessionManager,
+    ) {
+        let Ok(session) = ensure_hot_session(session_manager, WakeReason::ExplicitRefresh).await
+        else {
+            return;
+        };
+        let _ = session.send_video(&frame.bytes, frame.mime_type).await;
     }
 
     fn handle_share_args(&mut self, app: &mut App, args: &str) {
@@ -510,7 +526,7 @@ pub(crate) async fn handle_control_request(
     request: DesktopControlRequest,
     app: &mut App,
     store: &mut profile::ProfileStore,
-    runtime: &CliRuntime,
+    session_manager: &CliSessionManager,
     #[cfg(any(feature = "mic", feature = "speak"))] audio: &mut DesktopAudio,
     #[cfg(feature = "share-screen")] screen: &mut DesktopScreen,
 ) {
@@ -526,7 +542,7 @@ pub(crate) async fn handle_control_request(
         }),
         #[cfg(feature = "mic")]
         DesktopControlAction::SetMicrophone { enabled } => {
-            let result = audio.set_mic_enabled(enabled, app, runtime).await;
+            let result = audio.set_mic_enabled(enabled, app, session_manager).await;
             if result.is_ok()
                 && let Err(error) = persist_audio_state(store, app)
             {

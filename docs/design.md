@@ -30,7 +30,9 @@ The following paths execute every **100–250 ms** during 16 kHz audio streaming
 
 ### Known Performance Gaps
 
-Tracked in [`roadmap.md`](roadmap.md) items **P-1** through **P-5**.
+The protocol-layer allocation gaps that were tracked in the roadmap have now
+been addressed. Keep using the checked-in benches and idle regression tests to
+catch future regressions instead of assuming the current state will hold.
 
 ---
 
@@ -95,10 +97,12 @@ Multiple async tasks often need to hold the same session simultaneously (one sen
 buffers and returns a borrowed `&str`. After the encoder has established enough
 capacity, the encoding step itself avoids further heap allocation.
 
-**Note:** the current full send path still allocates when building owned
-message payloads and when `codec::encode` serializes JSON. `Session::send_audio`
-also still calls `STANDARD.encode()` directly. See [`roadmap.md`](roadmap.md)
-items **P-1** and **P-2**.
+**Note:** `AudioEncoder` still matters when a caller needs reusable
+PCM → base64 conversion for custom payload assembly, but the built-in
+`Session::send_audio` path now keeps its own runner-side base64 / MIME / JSON
+buffers. On the receive side, server inline audio is decoded during
+deserialization into `Bytes`, so `codec::into_events` no longer allocates a
+second owned audio buffer just to decompose the message.
 
 ### ADR-6: CLI setup changes are staged, then applied via explicit reconnect
 

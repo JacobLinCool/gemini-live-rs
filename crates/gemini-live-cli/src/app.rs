@@ -3,6 +3,7 @@
 //! This module is the canonical home for state transitions that should remain
 //! testable without a running terminal, audio device, or Live session.
 
+use bytes::Bytes;
 use gemini_live::types::ServerEvent;
 use gemini_live_runtime::{RuntimeEvent, RuntimeLifecycleEvent, RuntimeSendOperation};
 
@@ -27,13 +28,14 @@ pub enum AppCommand {
 pub enum ServerEventEffect {
     None,
     #[cfg(feature = "speak")]
-    PlayAudio(Vec<u8>),
+    PlayAudio(Bytes),
     #[cfg(feature = "speak")]
     ClearAudio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionState {
+    Dormant,
     Connecting,
     Connected,
     Reconnecting,
@@ -82,7 +84,7 @@ impl App {
         Self {
             messages: vec![Msg {
                 role: Role::System,
-                text: "connected — @file for media, /mic /speak to toggle audio, /share-screen to share screen, /tools to manage Live tools".to_string(),
+                text: "ready — @file for media, /mic /speak to toggle audio, /share-screen to share screen, /tools to manage Live tools".to_string(),
             }],
             pending: String::new(),
             input: input::InputEditor::new(),
@@ -90,7 +92,7 @@ impl App {
             completion_index: 0,
             quit: false,
             title: title.to_string(),
-            connection_state: ConnectionState::Connecting,
+            connection_state: ConnectionState::Dormant,
             lagged_events: 0,
             send_failures: 0,
             last_send_failure: None,
@@ -198,8 +200,26 @@ impl App {
         }
     }
 
+    pub(crate) fn mark_session_config_armed_for_next_wake(&mut self) {
+        self.active_tools = self.desired_tools;
+        self.active_system_instruction = self.desired_system_instruction.clone();
+        self.sys(format!(
+            "next wake will use tools: {}",
+            self.active_tools.summary()
+        ));
+        if let Some(system_instruction) = self.active_system_instruction.as_deref() {
+            self.sys(format!(
+                "next wake system instruction: {}",
+                summarize_system_instruction(system_instruction)
+            ));
+        } else {
+            self.sys("next wake system instruction: none".into());
+        }
+    }
+
     pub(crate) fn connection_label(&self) -> &'static str {
         match self.connection_state {
+            ConnectionState::Dormant => "dormant",
             ConnectionState::Connecting => "connecting",
             ConnectionState::Connected => "connected",
             ConnectionState::Reconnecting => "reconnecting",

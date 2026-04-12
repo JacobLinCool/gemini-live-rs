@@ -161,7 +161,7 @@ For convenience:
 session.send_audio(&pcm_i16_le_bytes).await?;
 ```
 
-For lower-overhead audio encoding with encoder buffer reuse:
+For custom payload assembly with a reusable encoder:
 
 ```rust
 let mut enc = AudioEncoder::new();
@@ -176,9 +176,10 @@ loop {
 }
 ```
 
-This avoids the extra base64-string allocation in `Session::send_audio`, but
-the current full message-building and JSON-encoding path still performs owned
-allocations; see [`docs/roadmap.md`](docs/roadmap.md).
+`Session::send_audio` now already uses runner-side reusable base64 / MIME /
+JSON buffers, so you no longer need `AudioEncoder + send_raw` just to avoid
+the old convenience-path base64 allocation. `AudioEncoder` remains useful when
+you want explicit control over payload assembly before calling `send_raw`.
 
 ## Tool Calling
 

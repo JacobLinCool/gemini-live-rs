@@ -495,4 +495,31 @@ mod tests {
             .clone();
         assert!(setup.history_config.is_none());
     }
+
+    #[test]
+    fn idle_decision_flips_exactly_at_timeout_boundary() {
+        let driver = FakeDriver::default();
+        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver);
+        let memory = InMemoryConversationMemory::new();
+        let idle_timeout = Duration::from_secs(90);
+        let manager = SessionManager::new(
+            runtime,
+            memory,
+            IdlePolicy {
+                idle_timeout,
+                ..Default::default()
+            },
+        );
+        let last_activity = Instant::now();
+        manager.record_activity(ActivityKind::TextInput, last_activity);
+
+        assert_eq!(
+            manager.idle_decision(last_activity + idle_timeout - Duration::from_millis(1)),
+            IdleDecision::StayHot
+        );
+        assert_eq!(
+            manager.idle_decision(last_activity + idle_timeout),
+            IdleDecision::EnterDormant
+        );
+    }
 }

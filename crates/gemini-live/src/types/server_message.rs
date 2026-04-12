@@ -6,11 +6,14 @@
 //! function decomposes it into a sequence of [`ServerEvent`]s — the
 //! application-facing abstraction.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
+use base64::Engine;
+use bytes::Bytes;
 use serde::Deserialize;
 
-use super::common::{Content, EmptyObject};
+use super::common::EmptyObject;
 
 // ── Wire-level struct ────────────────────────────────────────────────────────
 
@@ -44,7 +47,7 @@ pub struct ServerMessage {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerContent {
-    pub model_turn: Option<Content>,
+    pub model_turn: Option<ServerModelTurn>,
     #[serde(default)]
     pub turn_complete: Option<bool>,
     /// `true` once the model has finished generating (the turn may still be
@@ -58,6 +61,66 @@ pub struct ServerContent {
     /// Grounding metadata (schema may evolve — kept as opaque JSON).
     pub grounding_metadata: Option<serde_json::Value>,
     pub url_context_metadata: Option<serde_json::Value>,
+}
+
+/// Server-emitted model content.
+///
+/// This mirrors the wire shape of [`super::common::Content`] but keeps
+/// server-side inline data in decoded byte form so the recv hot path does not
+/// allocate a base64 `String` and then allocate a second buffer for decoded
+/// PCM.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerModelTurn {
+    #[serde(default)]
+    pub role: Option<String>,
+    pub parts: Vec<ServerPart>,
+}
+
+/// A single server-emitted model part.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPart {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub inline_data: Option<ServerInlineData>,
+}
+
+/// Base64-decoded inline server payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerInlineData {
+    pub data: Bytes,
+    pub mime_type: String,
+}
+
+impl<'de> Deserialize<'de> for ServerInlineData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawInlineData<'a> {
+            // Live audio payloads are unescaped base64, so `serde_json` can
+            // usually borrow the source slice directly here instead of
+            // allocating an owned `String` first.
+            #[serde(borrow)]
+            data: Cow<'a, str>,
+            mime_type: String,
+        }
+
+        let raw = RawInlineData::deserialize(deserializer)?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(raw.data.as_bytes())
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)?;
+
+        Ok(Self {
+            data,
+            mime_type: raw.mime_type,
+        })
+    }
 }
 
 /// Partial audio-transcription update from the server.
@@ -170,7 +233,10 @@ pub enum ServerEvent {
     /// A chunk of model-generated text.
     ModelText(String),
     /// A chunk of model-generated audio (base64-decoded raw PCM bytes, 24 kHz).
-    ModelAudio(Vec<u8>),
+    ///
+    /// The payload uses ref-counted storage so runtime fanout can clone audio
+    /// events in O(1) instead of copying the PCM bytes for every receiver.
+    ModelAudio(Bytes),
 
     /// The model finished generating (turn may still be open for metadata).
     GenerationComplete,

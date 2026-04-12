@@ -28,6 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -295,6 +296,25 @@ impl Connection {
     pub async fn send_text(&mut self, json: &str) -> Result<(), SendError> {
         self.sink
             .send(Message::text(json))
+            .await
+            .map_err(classify_send_error)
+    }
+
+    /// Send a UTF-8 JSON frame from an existing byte buffer.
+    ///
+    /// This is crate-internal because it assumes the caller already guarantees
+    /// the buffer contains valid UTF-8 JSON.
+    pub(crate) async fn send_json_bytes(&mut self, json: &[u8]) -> Result<(), SendError> {
+        let payload = unsafe {
+            // SAFETY: callers are restricted to the crate, and every current
+            // call site passes bytes produced by `codec::encode_into`, which
+            // only emits valid UTF-8 JSON.
+            tokio_tungstenite::tungstenite::Utf8Bytes::from_bytes_unchecked(Bytes::copy_from_slice(
+                json,
+            ))
+        };
+        self.sink
+            .send(Message::Text(payload))
             .await
             .map_err(classify_send_error)
     }

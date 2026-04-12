@@ -95,7 +95,7 @@ doc and enforced by the startup config helpers in the same file.
 
 ```
 ┌─ models/gemini-3.1-flash-live-preview ──────────────────┐
-│   connected — @file for media, /mic /speak for audio    │
+│   ready — @file for media, /mic /speak for audio        │
 │ [you] hello                                             │
 │ [model] 你好！有什麼我可以幫你的嗎？                       │
 │   [image] photo.jpg (45.2 KB, image/jpeg)               │  ← system info
@@ -141,13 +141,13 @@ spaces are not supported yet.
 | `/system show` | Show active vs staged system instruction. |
 | `/system set <text>` | Stage a new system instruction for the next applied session. Quote the text when it contains spaces you want preserved literally. |
 | `/system clear` | Stage removal of the system instruction. |
-| `/system apply` | Reconnect the Live session with the staged system instruction and staged tools, carrying conversation state when a resume handle is available. |
+| `/system apply` | Apply the staged system instruction and staged tools. If a session is currently hot, the CLI reconnects immediately with conversation carryover when a resume handle is available; if the CLI is dormant, the staged setup is armed for the next wake. |
 | `/tools` | Show active vs staged tool profile. |
 | `/tools list` | List the known tools and their current state (`active`, `staged`, `off`). |
 | `/tools enable <tool>` | Stage a tool for the next applied session. Known tools: `google-search`, `timer`, `list-files`, `read-file`, `run-command`, plus feature-gated CLI-local desktop tools such as `desktop-microphone`, `desktop-speaker`, and `desktop-screen-share`. |
 | `/tools disable <tool>` | Stage a tool removal for the next applied session. |
 | `/tools toggle <tool>` | Flip a tool in the staged profile. |
-| `/tools apply` | Reconnect the Live session with the staged tool profile, carrying conversation state when a resume handle is available. |
+| `/tools apply` | Apply the staged tool profile and staged system instruction. If a session is currently hot, the CLI reconnects immediately with conversation carryover when a resume handle is available; if the CLI is dormant, the staged setup is armed for the next wake. |
 
 When the input starts with `/`, the CLI shows slash-command completions in a
 popup above the input box. `Tab` accepts the selected completion and `Up` /
@@ -186,6 +186,7 @@ cargo build -p gemini-live-cli --no-default-features
 main.rs                  CLI entrypoint and event-loop composition
 app.rs                   Reducer-style app state transitions for slash/runtime events
 startup.rs               Profile/env resolution + default voice-first session template
+session.rs               CLI dormant/hot runtime bootstrap and wake helpers
 desktop.rs               CLI host wiring above `gemini-live-io`
 render.rs                Terminal lifecycle + TUI rendering
 input.rs                 Single-line editor wrapper built on `tui-textarea`
@@ -202,8 +203,10 @@ gemini-live-io           Shared desktop mic / speaker / screen adapters reused b
 
 The CLI now delegates session switchover, session-event forwarding, and
 tool-call request fanout to `gemini-live-runtime`; shared tool execution and
-budget-wrapped background handoff live in `gemini-live-harness`. The CLI keeps
-slash-command and runtime-event state reduction in `app.rs`, and uses
+budget-wrapped background handoff live in `gemini-live-harness`. The CLI starts
+in a dormant state, wakes the Live session only when it has real work to do,
+and returns to dormant after the idle gate clears. Slash-command and
+runtime-event state reduction stay in `app.rs`, while `main.rs` uses
 `tokio::select!` to concurrently poll:
 1. Terminal key events (crossterm `EventStream`)
 2. Runtime events (via `RuntimeEventReceiver`)

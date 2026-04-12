@@ -7,7 +7,7 @@ use cpal::{SampleFormat, StreamConfig};
 use crate::error::AudioIoError;
 
 use super::aec::{AEC_FRAME_SIZE, AEC_SAMPLE_RATE, AecHandle};
-use super::resample::linear_resample;
+use super::resample::linear_resample_into;
 
 /// Sample rate used by model audio returned from the Live API.
 pub const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
@@ -16,8 +16,23 @@ pub const MODEL_AUDIO_SAMPLE_RATE: u32 = 24_000;
 pub struct SpeakerPlayback {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<VecDeque<f32>>>,
+    push_state: Mutex<SpeakerPushState>,
     /// Native sample rate reported by the output device.
     pub device_sample_rate: u32,
+}
+
+#[derive(Default)]
+struct SpeakerCallbackState {
+    output_f32: Vec<f32>,
+    mono: Vec<f32>,
+    resampled: Vec<f32>,
+    aec_frame: Vec<f32>,
+}
+
+#[derive(Default)]
+struct SpeakerPushState {
+    decoded: Vec<f32>,
+    resampled: Vec<f32>,
 }
 
 impl std::fmt::Debug for SpeakerPlayback {
@@ -50,38 +65,62 @@ impl SpeakerPlayback {
         let shared_aec = aec.clone();
 
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    fill_and_feed_aec_f32(
-                        data,
-                        channels,
-                        device_sample_rate,
-                        &shared_buffer,
-                        &shared_aec,
-                    );
-                },
-                |e| tracing::warn!("speaker: {e}"),
-                None,
-            ),
-            SampleFormat::I16 => device.build_output_stream(
-                &config,
-                move |data: &mut [i16], _| {
-                    let mut f32_buffer = vec![0.0f32; data.len()];
-                    fill_and_feed_aec_f32(
-                        &mut f32_buffer,
-                        channels,
-                        device_sample_rate,
-                        &shared_buffer,
-                        &shared_aec,
-                    );
-                    for (output, sample) in data.iter_mut().zip(f32_buffer) {
-                        *output = (sample * 32767.0) as i16;
-                    }
-                },
-                |e| tracing::warn!("speaker: {e}"),
-                None,
-            ),
+            SampleFormat::F32 => {
+                let mut callback_state = SpeakerCallbackState::default();
+                device.build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _| {
+                        let SpeakerCallbackState {
+                            output_f32: _,
+                            mono,
+                            resampled,
+                            aec_frame,
+                        } = &mut callback_state;
+                        fill_and_feed_aec_f32(
+                            data,
+                            channels,
+                            device_sample_rate,
+                            &shared_buffer,
+                            &shared_aec,
+                            mono,
+                            resampled,
+                            aec_frame,
+                        );
+                    },
+                    |e| tracing::warn!("speaker: {e}"),
+                    None,
+                )
+            }
+            SampleFormat::I16 => {
+                let mut callback_state = SpeakerCallbackState::default();
+                device.build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _| {
+                        let SpeakerCallbackState {
+                            output_f32,
+                            mono,
+                            resampled,
+                            aec_frame,
+                        } = &mut callback_state;
+                        output_f32.resize(data.len(), 0.0);
+                        fill_and_feed_aec_f32(
+                            output_f32.as_mut_slice(),
+                            channels,
+                            device_sample_rate,
+                            &shared_buffer,
+                            &shared_aec,
+                            mono,
+                            resampled,
+                            aec_frame,
+                        );
+                        for (output, sample) in data.iter_mut().zip(output_f32.iter().copied()) {
+                            *output = (sample * 32767.0) as i16;
+                        }
+                    },
+                    |e| tracing::warn!("speaker: {e}"),
+                    None,
+                )
+            }
             format => {
                 return Err(AudioIoError::UnsupportedOutputFormat(format!("{format:?}")));
             }
@@ -95,6 +134,7 @@ impl SpeakerPlayback {
         Ok(Self {
             _stream: stream,
             buffer,
+            push_state: Mutex::new(SpeakerPushState::default()),
             device_sample_rate,
         })
     }
@@ -108,19 +148,24 @@ impl SpeakerPlayback {
 
     /// Queue model PCM audio (`24 kHz`, `i16`, little-endian) for playback.
     pub fn push_model_pcm24k_i16(&self, pcm_i16_le: &[u8]) {
-        let samples: Vec<f32> = pcm_i16_le
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
-            .collect();
+        let mut push_state = self.push_state.lock().expect("speaker push state lock");
+        let SpeakerPushState { decoded, resampled } = &mut *push_state;
+        decode_pcm_i16le_to_f32_into(decoded, pcm_i16_le);
 
         let output = if self.device_sample_rate == MODEL_AUDIO_SAMPLE_RATE {
-            samples
+            decoded.as_slice()
         } else {
-            linear_resample(&samples, MODEL_AUDIO_SAMPLE_RATE, self.device_sample_rate)
+            linear_resample_into(
+                resampled,
+                decoded,
+                MODEL_AUDIO_SAMPLE_RATE,
+                self.device_sample_rate,
+            );
+            resampled.as_slice()
         };
 
         if let Ok(mut buffer) = self.buffer.lock() {
-            buffer.extend(output);
+            buffer.extend(output.iter().copied());
         }
     }
 }
@@ -131,6 +176,9 @@ fn fill_and_feed_aec_f32(
     device_sample_rate: u32,
     buffer: &Mutex<VecDeque<f32>>,
     aec: &AecHandle,
+    mono: &mut Vec<f32>,
+    resampled: &mut Vec<f32>,
+    aec_frame: &mut Vec<f32>,
 ) {
     if let Ok(mut shared_buffer) = buffer.try_lock() {
         for frame in data.chunks_mut(channels) {
@@ -142,19 +190,34 @@ fn fill_and_feed_aec_f32(
         return;
     }
 
-    let mono: Vec<f32> = data.chunks(channels).map(|frame| frame[0]).collect();
+    mono.resize(data.len() / channels, 0.0);
+    for (slot, frame) in mono.iter_mut().zip(data.chunks_exact(channels)) {
+        *slot = frame[0];
+    }
+
     let aec_input = if device_sample_rate == AEC_SAMPLE_RATE {
-        mono
+        mono.as_slice()
     } else {
-        linear_resample(&mono, device_sample_rate, AEC_SAMPLE_RATE)
+        linear_resample_into(resampled, mono, device_sample_rate, AEC_SAMPLE_RATE);
+        resampled.as_slice()
     };
 
+    aec_frame.resize(AEC_FRAME_SIZE, 0.0);
     for chunk in aec_input.chunks(AEC_FRAME_SIZE) {
         if chunk.len() < AEC_FRAME_SIZE {
             break;
         }
 
-        let mut frame = chunk.to_vec();
-        aec.processor().process_render_frame(&mut [&mut frame]).ok();
+        aec_frame.copy_from_slice(chunk);
+        aec.processor()
+            .process_render_frame(&mut [&mut aec_frame[..]])
+            .ok();
+    }
+}
+
+fn decode_pcm_i16le_to_f32_into(output: &mut Vec<f32>, pcm_i16_le: &[u8]) {
+    output.resize(pcm_i16_le.len() / std::mem::size_of::<i16>(), 0.0);
+    for (slot, chunk) in output.iter_mut().zip(pcm_i16_le.chunks_exact(2)) {
+        *slot = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
     }
 }

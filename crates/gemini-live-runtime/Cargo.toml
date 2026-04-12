@@ -16,3 +16,9 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+criterion = { version = "0.8", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "managed_runtime"
+harness = false

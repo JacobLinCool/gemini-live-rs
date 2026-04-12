@@ -26,6 +26,7 @@ use std::io::{
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use gemini_live_runtime::{GeminiSessionHandle, RuntimeSession};
 use serenity::all::{ChannelId, GuildId, UserId};
 use songbird::events::context_data::VoiceTick;
@@ -172,10 +173,7 @@ impl ActiveVoiceBridge {
         stop_playback(&self.playback);
     }
 
-    pub async fn push_model_audio(
-        &self,
-        pcm_i16_le_24k: Vec<u8>,
-    ) -> Result<(), DiscordServiceError> {
+    pub async fn push_model_audio(&self, pcm_i16_le_24k: Bytes) -> Result<(), DiscordServiceError> {
         let pcm_f32_le = pcm_i16le_to_f32le_bytes(&pcm_i16_le_24k);
         {
             let mut state = self.playback.state.lock().expect("playback state lock");

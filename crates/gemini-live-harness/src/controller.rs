@@ -14,13 +14,11 @@
 //! safe to inject a notification?" and "how should a notification prompt be
 //! sent back to the model?". The harness controller owns everything else.
 
+use gemini_live::types::{FunctionCallRequest, FunctionResponse, Tool};
+use serde_json::json;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use gemini_live::types::{FunctionCallRequest, FunctionResponse, Tool};
-use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -130,12 +128,6 @@ where
         self
     }
 
-    pub fn with_notification_interval(mut self, interval: Duration) -> Self {
-        self.notification_pump =
-            PassiveNotificationPump::with_interval(self.harness().clone(), interval);
-        self
-    }
-
     pub fn harness(&self) -> &Harness {
         self.notification_pump.harness()
     }
@@ -202,12 +194,22 @@ where
         }
     }
 
-    pub fn notification_interval(&self) -> Duration {
-        self.notification_pump.interval()
-    }
-
     pub fn current_in_flight_notification_id(&self) -> Option<String> {
         self.notification_pump.current_in_flight_notification_id()
+    }
+
+    pub fn passive_notification_queue_version(&self) -> u64 {
+        self.notification_pump.queue_version()
+    }
+
+    pub async fn wait_for_passive_notification_signal(&self, observed_queue_version: u64) {
+        self.notification_pump
+            .wait_for_signal_since(observed_queue_version)
+            .await;
+    }
+
+    pub fn notify_passive_notification_gate_changed(&self) {
+        self.notification_pump.notify_delivery_gate_changed();
     }
 
     pub fn recover_orphaned_deliveries(&self) -> Result<usize, HarnessError> {
@@ -224,10 +226,10 @@ where
 
     pub async fn dispatch_passive_notification_once<D, DFut, E>(
         &self,
-        deliver: &D,
+        deliver: D,
     ) -> Result<(), HarnessError>
     where
-        D: Fn(PassiveNotificationDelivery) -> DFut + Send + Sync,
+        D: FnOnce(PassiveNotificationDelivery) -> DFut + Send,
         DFut: Future<Output = Result<(), E>> + Send,
         E: std::fmt::Display + Send,
     {

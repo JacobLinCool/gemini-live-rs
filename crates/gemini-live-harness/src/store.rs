@@ -2,8 +2,11 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::error::HarnessError;
 use crate::fs::{
@@ -25,6 +28,36 @@ const TASK_RESULT_FILE_NAME: &str = "result.json";
 const DEFAULT_PROFILE_FILE_NAME: &str = "default-profile.json";
 const PROFILES_DIR_NAME: &str = "profiles";
 const DEFAULT_PROFILE_NAME: &str = "default";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NotificationSignal {
+    queue_version: Arc<AtomicU64>,
+    queue_notify: Arc<Notify>,
+}
+
+impl NotificationSignal {
+    pub(crate) fn current_version(&self) -> u64 {
+        self.queue_version.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn notify_queue_changed(&self) {
+        self.queue_version.fetch_add(1, Ordering::SeqCst);
+        self.queue_notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_queue_change_since(&self, observed_version: u64) {
+        loop {
+            if self.current_version() != observed_version {
+                return;
+            }
+            let notified = self.queue_notify.notified();
+            if self.current_version() != observed_version {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// File layout configuration for the durable harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +157,16 @@ impl HarnessPaths {
 #[derive(Debug, Clone)]
 pub struct Harness {
     paths: HarnessPaths,
+    notification_signal: NotificationSignal,
 }
 
 impl Harness {
     pub fn new(paths: HarnessPaths) -> Result<Self, HarnessError> {
         paths.ensure_layout()?;
-        Ok(Self { paths })
+        Ok(Self {
+            paths,
+            notification_signal: NotificationSignal::default(),
+        })
     }
 
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, HarnessError> {
@@ -146,6 +183,10 @@ impl Harness {
 
     pub fn paths(&self) -> &HarnessPaths {
         &self.paths
+    }
+
+    pub(crate) fn notification_signal(&self) -> NotificationSignal {
+        self.notification_signal.clone()
     }
 
     pub fn start_task(&self, request: NewRunningTask) -> Result<HarnessTask, HarnessError> {
@@ -439,6 +480,7 @@ impl Harness {
             acknowledged_at_ms: None,
         };
         self.write_notification(&notification)?;
+        self.notification_signal.notify_queue_changed();
         Ok(notification)
     }
 
@@ -479,6 +521,7 @@ impl Harness {
                 notification.updated_at_ms = now;
                 notification.delivered_at_ms = Some(now);
                 self.write_notification(&notification)?;
+                self.notification_signal.notify_queue_changed();
                 Ok(notification)
             }
             NotificationStatus::Delivered => Ok(notification),
@@ -505,6 +548,7 @@ impl Harness {
                 }
                 notification.acknowledged_at_ms = Some(now);
                 self.write_notification(&notification)?;
+                self.notification_signal.notify_queue_changed();
                 Ok(notification)
             }
             NotificationStatus::Acknowledged => Ok(notification),
@@ -524,6 +568,7 @@ impl Harness {
                 notification.updated_at_ms = now;
                 notification.delivered_at_ms = None;
                 self.write_notification(&notification)?;
+                self.notification_signal.notify_queue_changed();
                 Ok(notification)
             }
             NotificationStatus::Acknowledged => Err(HarnessError::NotificationStatusConflict {

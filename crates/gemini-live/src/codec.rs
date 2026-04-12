@@ -4,6 +4,7 @@
 //! session layer (typed events).  It provides three operations:
 //!
 //! - [`encode`] — serialise a [`ClientMessage`] to a JSON string for sending.
+//! - [`encode_into`] — serialise a [`ClientMessage`] into a reusable byte buffer.
 //! - [`decode`] — parse a JSON string from the wire into a [`ServerMessage`].
 //! - [`into_events`] — decompose one [`ServerMessage`] into a `Vec<ServerEvent>`.
 //!
@@ -13,18 +14,87 @@
 
 use std::time::Duration;
 
-use base64::Engine;
+use serde::Serialize;
 
 use crate::error::CodecError;
 use crate::types::{ClientMessage, ServerEvent, ServerMessage};
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RealtimeInputBlobKind {
+    Audio,
+    Video,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlobRef<'a> {
+    data: &'a str,
+    mime_type: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RealtimeInputBlobRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<BlobRef<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video: Option<BlobRef<'a>>,
+}
+
+#[derive(Serialize)]
+enum ClientMessageBlobRef<'a> {
+    #[serde(rename = "realtimeInput")]
+    RealtimeInput(RealtimeInputBlobRef<'a>),
+}
+
 /// Serialise a [`ClientMessage`] to its JSON wire representation.
 ///
-/// **Performance note:** allocates a new `String` per call.  A future
-/// `encode_into` variant accepting a reusable buffer is planned
-/// (see `docs/roadmap.md` P-2).
+/// **Performance note:** allocates a new `String` per call. For hot paths,
+/// prefer [`encode_into`] so the caller can reuse its own buffer.
 pub fn encode(msg: &ClientMessage) -> Result<String, CodecError> {
-    serde_json::to_string(msg).map_err(CodecError::Serialize)
+    let mut output = Vec::new();
+    encode_into(&mut output, msg)?;
+    // SAFETY: `serde_json` only emits valid UTF-8.
+    Ok(unsafe { String::from_utf8_unchecked(output) })
+}
+
+/// Serialise a [`ClientMessage`] into a reusable UTF-8 byte buffer.
+///
+/// This is the preferred API for send-path hot loops such as the session
+/// runner, because it lets callers keep one JSON buffer alive across many
+/// messages instead of allocating a fresh `String` every time.
+pub fn encode_into(output: &mut Vec<u8>, msg: &ClientMessage) -> Result<(), CodecError> {
+    output.clear();
+    serde_json::to_writer(output, msg).map_err(CodecError::Serialize)
+}
+
+/// Serialise a one-field `realtimeInput` inline-data message into a reusable
+/// buffer without forcing the caller to allocate owned `String`s first.
+pub(crate) fn encode_realtime_input_blob_into(
+    output: &mut Vec<u8>,
+    kind: RealtimeInputBlobKind,
+    mime_type: &str,
+    data_b64: &str,
+) -> Result<(), CodecError> {
+    output.clear();
+
+    let blob = BlobRef {
+        data: data_b64,
+        mime_type,
+    };
+    let input = match kind {
+        RealtimeInputBlobKind::Audio => RealtimeInputBlobRef {
+            audio: Some(blob),
+            video: None,
+        },
+        RealtimeInputBlobKind::Video => RealtimeInputBlobRef {
+            audio: None,
+            video: Some(blob),
+        },
+    };
+
+    serde_json::to_writer(output, &ClientMessageBlobRef::RealtimeInput(input))
+        .map_err(CodecError::Serialize)
 }
 
 /// Parse a JSON string from the wire into a [`ServerMessage`].
@@ -77,12 +147,7 @@ pub fn into_events(msg: ServerMessage) -> Vec<ServerEvent> {
                     events.push(ServerEvent::ModelText(text));
                 }
                 if let Some(blob) = part.inline_data {
-                    match base64::engine::general_purpose::STANDARD.decode(&blob.data) {
-                        Ok(bytes) => events.push(ServerEvent::ModelAudio(bytes)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to base64-decode model audio");
-                        }
-                    }
+                    events.push(ServerEvent::ModelAudio(blob.data));
                 }
             }
         }
@@ -147,6 +212,60 @@ mod tests {
     use crate::types::*;
 
     // ── encode ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_into_matches_encode() {
+        let msg = ClientMessage::RealtimeInput(RealtimeInput {
+            text: Some("hello".into()),
+            ..Default::default()
+        });
+        let string_json = encode(&msg).unwrap();
+        let mut bytes_json = Vec::new();
+        encode_into(&mut bytes_json, &msg).unwrap();
+        assert_eq!(std::str::from_utf8(&bytes_json).unwrap(), string_json);
+    }
+
+    #[test]
+    fn encode_realtime_input_audio_blob_matches_owned_message() {
+        let msg = ClientMessage::RealtimeInput(RealtimeInput {
+            audio: Some(crate::types::Blob {
+                data: "AQID".into(),
+                mime_type: "audio/pcm;rate=16000".into(),
+            }),
+            ..Default::default()
+        });
+        let string_json = encode(&msg).unwrap();
+        let mut bytes_json = Vec::new();
+        encode_realtime_input_blob_into(
+            &mut bytes_json,
+            RealtimeInputBlobKind::Audio,
+            "audio/pcm;rate=16000",
+            "AQID",
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes_json).unwrap(), string_json);
+    }
+
+    #[test]
+    fn encode_realtime_input_video_blob_matches_owned_message() {
+        let msg = ClientMessage::RealtimeInput(RealtimeInput {
+            video: Some(crate::types::Blob {
+                data: "AQID".into(),
+                mime_type: "image/jpeg".into(),
+            }),
+            ..Default::default()
+        });
+        let string_json = encode(&msg).unwrap();
+        let mut bytes_json = Vec::new();
+        encode_realtime_input_blob_into(
+            &mut bytes_json,
+            RealtimeInputBlobKind::Video,
+            "image/jpeg",
+            "AQID",
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes_json).unwrap(), string_json);
+    }
 
     #[test]
     fn encode_setup_minimal() {
@@ -381,6 +500,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_server_content_audio_decodes_inline_data() {
+        let json = r#"{
+            "serverContent": {
+                "modelTurn": {
+                    "parts": [{
+                        "inlineData": {
+                            "data": "AQID",
+                            "mimeType": "audio/pcm;rate=24000"
+                        }
+                    }]
+                }
+            }
+        }"#;
+        let msg = decode(json).unwrap();
+        let sc = msg.server_content.unwrap();
+        let turn = sc.model_turn.unwrap();
+        let inline = turn.parts[0].inline_data.as_ref().unwrap();
+        assert_eq!(inline.data.as_ref(), [1, 2, 3]);
+        assert_eq!(inline.mime_type, "audio/pcm;rate=24000");
+    }
+
+    #[test]
     fn decode_tool_call() {
         let json = r#"{
             "toolCall": {
@@ -501,7 +642,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, ServerEvent::ModelAudio(b) if b == &[1, 2, 3]))
+                .any(|e| matches!(e, ServerEvent::ModelAudio(b) if b.as_ref() == [1, 2, 3]))
         );
     }
 

@@ -892,6 +892,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -1747,6 +1748,7 @@ name = "gemini-live"
 version = "0.1.8"
 dependencies = [
  "base64",
+ "bytes",
  "criterion",
  "futures-util",
  "google-cloud-auth",
@@ -1764,6 +1766,7 @@ dependencies = [
 name = "gemini-live-cli"
 version = "0.1.8"
 dependencies = [
+ "bytes",
  "clap",
  "crossterm",
  "futures-util",
@@ -1788,6 +1791,7 @@ dependencies = [
 name = "gemini-live-discord"
 version = "0.1.8"
 dependencies = [
+ "bytes",
  "gemini-live",
  "gemini-live-harness",
  "gemini-live-runtime",
@@ -1807,6 +1811,7 @@ dependencies = [
 name = "gemini-live-harness"
 version = "0.1.8"
 dependencies = [
+ "criterion",
  "futures-util",
  "gemini-live",
  "gemini-live-runtime",
@@ -1835,6 +1840,8 @@ name = "gemini-live-runtime"
 version = "0.1.8"
 dependencies = [
  "base64",
+ "bytes",
+ "criterion",
  "futures-util",
  "gemini-live",
  "serde_json",

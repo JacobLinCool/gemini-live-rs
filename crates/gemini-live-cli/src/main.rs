@@ -42,6 +42,7 @@ mod media;
 mod outbound;
 mod profile;
 mod render;
+mod session;
 mod slash;
 mod startup;
 mod tooling;
@@ -63,11 +64,12 @@ use gemini_live_harness::{
     Harness, HarnessController, HarnessRuntimeBridge, HarnessToolBudget,
     HarnessToolCompletionDisposition,
 };
-use gemini_live_runtime::{GeminiSessionDriver, ManagedRuntime, RuntimeEvent, RuntimeSession};
-use startup::{
-    StartupConfig, build_cli_setup_with_tools, build_runtime_config_with_tools,
-    resolve_startup_config,
+use gemini_live_runtime::{RuntimeEvent, RuntimeLifecycleEvent, RuntimeSession, WakeReason};
+use session::{
+    ApplySessionConfigDisposition, CLI_IDLE_TIMEOUT, apply_staged_setup, ensure_hot_session,
+    new_session_manager,
 };
+use startup::{StartupConfig, build_cli_setup_with_tools, resolve_startup_config};
 
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_BIN_NAME"))]
@@ -82,6 +84,11 @@ struct CliArgs {
 enum CliCommand {
     Update,
     Config,
+}
+
+enum KeyAction {
+    Command(AppCommand),
+    SendUserInput(String),
 }
 
 #[tokio::main]
@@ -168,17 +175,18 @@ async fn run(
         "system instruction active: {}",
         summarize_optional_system_instruction(app.active_system_instruction.as_deref())
     ));
-    let (mut runtime, mut runtime_events) = ManagedRuntime::new(
-        build_runtime_config_with_tools(
-            &startup,
-            initial_setup_tools,
-            app.active_system_instruction.as_deref(),
-        ),
-        GeminiSessionDriver,
+    let (mut session_manager, mut runtime_events) = new_session_manager(
+        &startup,
+        initial_setup_tools,
+        app.active_system_instruction.as_deref(),
     );
-    runtime.connect().await?;
-    let mut notification_ticks =
-        tokio::time::interval(active_harness_controller.notification_interval());
+    let mut passive_notification_version =
+        active_harness_controller.passive_notification_queue_version();
+    let idle_sleep = tokio::time::sleep(CLI_IDLE_TIMEOUT);
+    tokio::pin!(idle_sleep);
+    let mut dormant_close_in_flight = false;
+    let mut turn_in_flight = false;
+    let mut tool_calls_in_flight = 0usize;
 
     #[cfg(any(feature = "mic", feature = "speak"))]
     let mut audio = desktop::DesktopAudio::new()?;
@@ -189,7 +197,7 @@ async fn run(
 
     #[cfg(any(feature = "mic", feature = "speak"))]
     audio
-        .autostart(&startup, &mut app, &mut profile_store, &runtime)
+        .autostart(&startup, &mut app, &mut profile_store, &session_manager)
         .await?;
     #[cfg(feature = "share-screen")]
     screen.autostart(&startup, &mut app, &mut profile_store)?;
@@ -222,12 +230,29 @@ async fn run(
                     request,
                     &mut app,
                     &mut profile_store,
-                    &runtime,
+                    &session_manager,
                     #[cfg(any(feature = "mic", feature = "speak"))]
                     &mut audio,
                     #[cfg(feature = "share-screen")]
                     &mut screen,
                 ).await;
+                if try_dispatch_passive_notification(
+                    &mut app,
+                    &mut session_manager,
+                    &active_harness_controller,
+                    turn_in_flight,
+                    tool_calls_in_flight,
+                )
+                .await?
+                .is_some()
+                {
+                    turn_in_flight = true;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                }
+                passive_notification_version =
+                    active_harness_controller.passive_notification_queue_version();
             }
             Some(Ok(ev)) = term_events.next() => {
                 if let Event::Key(key) = ev
@@ -236,70 +261,112 @@ async fn run(
                     let previous_desired_tools = app.desired_tools;
                     let previous_desired_system_instruction =
                         app.desired_system_instruction.clone();
-                    let session = runtime
-                        .active_session()
-                        .expect("runtime session must exist while the CLI event loop is running");
-                    if let Some(command) = handle_key(&mut app, key, &session).await? {
+                    if let Some(action) = handle_key(&mut app, key)? {
                         #[allow(unused_mut)]
                         let mut handled_by_host = false;
-                        #[cfg(any(feature = "mic", feature = "speak"))]
-                        {
-                            handled_by_host = audio
-                                .handle_command(
-                                    &command,
-                                    &mut app,
-                                    &mut profile_store,
-                                    &runtime,
+                        let mut reset_idle_deadline = false;
+                        match action {
+                            KeyAction::SendUserInput(line) => {
+                                let session = ensure_hot_session(
+                                    &mut session_manager,
+                                    WakeReason::TextInput,
                                 )
-                                .await?
-                                || handled_by_host;
-                        }
-                        #[cfg(feature = "share-screen")]
-                        {
-                            handled_by_host = screen
-                                .handle_command(&command, &mut app, &mut profile_store)?
-                                || handled_by_host;
-                        }
-                        if !handled_by_host && command == AppCommand::ApplySessionConfig {
-                            if !app.has_staged_session_changes() {
-                                app.sys("session config already active".into());
-                            } else {
-                                let desired_host_tools = tooling::ToolRuntime::new(
-                                    workspace_root.clone(),
-                                    app.desired_tools,
-                                    desktop_control_port.clone(),
-                                )?;
-                                let desired_harness_controller = build_harness_controller(
-                                    harness.clone(),
-                                    desired_host_tools,
-                                )?;
-                                let desired_setup_tools =
-                                    desired_harness_controller.advertised_tools();
-                                runtime.replace_desired_setup(build_cli_setup_with_tools(
-                                    &startup,
-                                    desired_setup_tools,
-                                    app.desired_system_instruction.as_deref(),
-                                ));
-                                match runtime.apply().await {
-                                    Ok(_report) => {
-                                        active_harness_controller = desired_harness_controller;
-                                        active_harness_runtime_bridge =
-                                            HarnessRuntimeBridge::new(
-                                                active_harness_controller.clone(),
-                                            );
-                                        app.mark_session_config_applied();
-                                        profile_store.set_tool_profile(app.active_tools)?;
-                                        profile_store.set_system_instruction(
-                                            app.active_system_instruction.clone(),
+                                .await?;
+                                outbound::send_user_input(&mut app, &session, &line).await?;
+                                turn_in_flight = true;
+                                reset_idle_deadline = true;
+                            }
+                            KeyAction::Command(command) => {
+                                #[cfg(any(feature = "mic", feature = "speak"))]
+                                {
+                                    handled_by_host = audio
+                                        .handle_command(
+                                            &command,
+                                            &mut app,
+                                            &mut profile_store,
+                                            &session_manager,
+                                        )
+                                        .await?
+                                        || handled_by_host;
+                                }
+                                #[cfg(feature = "share-screen")]
+                                {
+                                    handled_by_host = screen
+                                        .handle_command(&command, &mut app, &mut profile_store)?
+                                        || handled_by_host;
+                                }
+                                if !handled_by_host && command == AppCommand::ApplySessionConfig {
+                                    if !app.has_staged_session_changes() {
+                                        app.sys("session config already active".into());
+                                    } else {
+                                        let desired_host_tools = tooling::ToolRuntime::new(
+                                            workspace_root.clone(),
+                                            app.desired_tools,
+                                            desktop_control_port.clone(),
                                         )?;
-                                    }
-                                    Err(e) => {
-                                        app.sys(format!(
-                                            "failed to apply staged session config: {e}"
-                                        ));
+                                        let desired_harness_controller =
+                                            build_harness_controller(
+                                                harness.clone(),
+                                                desired_host_tools,
+                                            )?;
+                                        let desired_setup = build_cli_setup_with_tools(
+                                            &startup,
+                                            desired_harness_controller.advertised_tools(),
+                                            app.desired_system_instruction.as_deref(),
+                                        );
+                                        match apply_staged_setup(
+                                            &mut session_manager,
+                                            desired_setup,
+                                        )
+                                        .await
+                                        {
+                                            Ok(ApplySessionConfigDisposition::Reconnected) => {
+                                                active_harness_controller =
+                                                    desired_harness_controller;
+                                                active_harness_runtime_bridge =
+                                                    HarnessRuntimeBridge::new(
+                                                        active_harness_controller.clone(),
+                                                    );
+                                                app.mark_session_config_applied();
+                                                profile_store.set_tool_profile(
+                                                    app.active_tools,
+                                                )?;
+                                                profile_store.set_system_instruction(
+                                                    app.active_system_instruction.clone(),
+                                                )?;
+                                                reset_idle_deadline = true;
+                                            }
+                                            Ok(
+                                                ApplySessionConfigDisposition::ArmedForNextWake,
+                                            ) => {
+                                                active_harness_controller =
+                                                    desired_harness_controller;
+                                                active_harness_runtime_bridge =
+                                                    HarnessRuntimeBridge::new(
+                                                        active_harness_controller.clone(),
+                                                    );
+                                                app.mark_session_config_armed_for_next_wake();
+                                                profile_store.set_tool_profile(
+                                                    app.active_tools,
+                                                )?;
+                                                profile_store.set_system_instruction(
+                                                    app.active_system_instruction.clone(),
+                                                )?;
+                                            }
+                                            Err(error) => {
+                                                app.sys(format!(
+                                                    "failed to apply staged session config: {error}"
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                        if reset_idle_deadline {
+                            idle_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
                         }
                     }
                     if app.desired_tools != previous_desired_tools {
@@ -309,19 +376,57 @@ async fn run(
                         profile_store
                             .set_system_instruction(app.desired_system_instruction.clone())?;
                     }
+                    if try_dispatch_passive_notification(
+                        &mut app,
+                        &mut session_manager,
+                        &active_harness_controller,
+                        turn_in_flight,
+                        tool_calls_in_flight,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        turn_in_flight = true;
+                        idle_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                    }
+                    passive_notification_version =
+                        active_harness_controller.passive_notification_queue_version();
                 }
             }
             Some(event) = runtime_events.recv() => {
+                if dormant_close_in_flight
+                    && matches!(
+                        event,
+                        RuntimeEvent::Lifecycle(RuntimeLifecycleEvent::Closed { .. })
+                    )
+                {
+                    dormant_close_in_flight = false;
+                    continue;
+                }
                 let _ = active_harness_runtime_bridge.handle_runtime_event(&event);
-                match event.clone() {
+                match &event {
                     RuntimeEvent::Server(ServerEvent::TurnComplete) => {
                         let _ = active_harness_controller.acknowledge_in_flight_notification()?;
+                        turn_in_flight = false;
                     }
                     RuntimeEvent::Server(ServerEvent::Interrupted) => {
                         let _ = active_harness_controller.requeue_in_flight_notification()?;
+                        turn_in_flight = false;
+                    }
+                    RuntimeEvent::ToolCallRequested { .. } => {
+                        tool_calls_in_flight = tool_calls_in_flight.saturating_add(1);
+                    }
+                    RuntimeEvent::Lifecycle(RuntimeLifecycleEvent::Closed { .. }) => {
+                        turn_in_flight = false;
+                        tool_calls_in_flight = 0;
                     }
                     _ => {}
                 }
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
                 let effect = app.apply_runtime_event(event);
                 #[cfg(any(feature = "mic", feature = "speak"))]
                 audio.apply_server_effect(effect);
@@ -329,23 +434,66 @@ async fn run(
                 match effect {
                     app::ServerEventEffect::None => {}
                 }
+                if try_dispatch_passive_notification(
+                    &mut app,
+                    &mut session_manager,
+                    &active_harness_controller,
+                    turn_in_flight,
+                    tool_calls_in_flight,
+                )
+                .await?
+                .is_some()
+                {
+                    turn_in_flight = true;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                }
+                passive_notification_version =
+                    active_harness_controller.passive_notification_queue_version();
             }
-            Some(forwarded) = active_harness_runtime_bridge.recv_and_forward_tool_completion(|responses| runtime.send_tool_response(responses)) => {
+            Some(forwarded) = active_harness_runtime_bridge.recv_and_forward_tool_completion(|responses| async {
+                let session = ensure_hot_session(
+                    &mut session_manager,
+                    WakeReason::PassiveNotification,
+                )
+                .await?;
+                session
+                    .send_tool_response(responses)
+                    .await
+                    .map_err(gemini_live_runtime::RuntimeError::from)
+            }) => {
+                tool_calls_in_flight = tool_calls_in_flight.saturating_sub(1);
                 match forwarded {
-                    Ok(outcome) => match outcome.disposition {
-                        HarnessToolCompletionDisposition::Responded => {
-                            app.sys(format!("[tool] responded: {} ({})", outcome.call_name, outcome.call_id));
+                    Ok(outcome) => {
+                        if matches!(
+                            outcome.disposition,
+                            HarnessToolCompletionDisposition::Responded
+                                | HarnessToolCompletionDisposition::Failed
+                        ) {
+                            turn_in_flight = true;
+                            idle_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
                         }
-                        HarnessToolCompletionDisposition::Failed => {
-                            app.sys(format!(
-                                "[tool error] {} ({}): execution failed",
-                                outcome.call_name, outcome.call_id
-                            ));
+                        match outcome.disposition {
+                            HarnessToolCompletionDisposition::Responded => {
+                                app.sys(format!(
+                                    "[tool] responded: {} ({})",
+                                    outcome.call_name, outcome.call_id
+                                ));
+                            }
+                            HarnessToolCompletionDisposition::Failed => {
+                                app.sys(format!(
+                                    "[tool error] {} ({}): execution failed",
+                                    outcome.call_name, outcome.call_id
+                                ));
+                            }
+                            HarnessToolCompletionDisposition::Cancelled => {
+                                app.sys(format!("[tool] cancelled {}", outcome.call_id));
+                            }
                         }
-                        HarnessToolCompletionDisposition::Cancelled => {
-                            app.sys(format!("[tool] cancelled {}", outcome.call_id));
-                        }
-                    },
+                    }
                     Err(error) => {
                         app.sys(format!(
                             "[tool error] {} ({}): {}",
@@ -353,50 +501,90 @@ async fn run(
                         ));
                     }
                 }
-            }
-            _ = notification_ticks.tick() => {
-                if can_deliver_passive_notification(&app) {
-                    let had_in_flight =
-                        active_harness_controller.current_in_flight_notification_id();
-                    let runtime_ref = &runtime;
-                    active_harness_controller
-                        .dispatch_passive_notification_once(&|delivery| {
-                            let prompt = delivery.prompt;
-                            async move {
-                                runtime_ref
-                                    .send_text(&prompt)
-                                .await
-                                .map_err(|error| error.to_string())
-                            }
-                        })
-                        .await?;
-                    if had_in_flight.is_none()
-                        && let Some(notification_id) =
-                            active_harness_controller.current_in_flight_notification_id()
-                    {
-                        app.sys(format!(
-                            "[harness] delivered background notification {notification_id}"
-                        ));
-                    }
+                if try_dispatch_passive_notification(
+                    &mut app,
+                    &mut session_manager,
+                    &active_harness_controller,
+                    turn_in_flight,
+                    tool_calls_in_flight,
+                )
+                .await?
+                .is_some()
+                {
+                    turn_in_flight = true;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
                 }
+                passive_notification_version =
+                    active_harness_controller.passive_notification_queue_version();
+            }
+            _ = active_harness_controller.wait_for_passive_notification_signal(passive_notification_version) => {
+                if try_dispatch_passive_notification(
+                    &mut app,
+                    &mut session_manager,
+                    &active_harness_controller,
+                    turn_in_flight,
+                    tool_calls_in_flight,
+                )
+                .await?
+                .is_some()
+                {
+                    turn_in_flight = true;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                }
+                passive_notification_version =
+                    active_harness_controller.passive_notification_queue_version();
             }
             Some(captured) = mic_event => {
                 #[cfg(feature = "mic")]
-                audio.forward_captured(captured, &runtime).await;
+                {
+                    audio.forward_captured(captured, &mut session_manager).await;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                }
                 #[cfg(not(feature = "mic"))]
                 let _ = captured;
             }
             Some(frame) = screen_event => {
                 #[cfg(feature = "share-screen")]
-                screen.forward_frame(frame, &runtime).await;
+                {
+                    screen.forward_frame(frame, &mut session_manager).await;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                }
                 #[cfg(not(feature = "share-screen"))]
                 let _ = frame;
+            }
+            _ = &mut idle_sleep => {
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + CLI_IDLE_TIMEOUT);
+                if session_manager.active_session().is_some()
+                    && can_enter_dormant(
+                        &app,
+                        turn_in_flight,
+                        tool_calls_in_flight,
+                        active_harness_controller.current_in_flight_notification_id().is_some(),
+                    )
+                {
+                    dormant_close_in_flight = true;
+                    session_manager.enter_dormant().await?;
+                    app.connection_state = ConnectionState::Dormant;
+                    app.sys("session dormant".into());
+                }
             }
         }
     }
 
     active_harness_controller.abort_all_tool_calls();
-    runtime.close().await?;
+    if session_manager.active_session().is_some() {
+        session_manager.enter_dormant().await?;
+    }
     Ok(())
 }
 
@@ -408,22 +596,112 @@ fn build_harness_controller(
         .map(|controller| controller.with_budget(HarnessToolBudget::default()))
 }
 
-fn can_deliver_passive_notification(app: &App) -> bool {
-    matches!(app.connection_state, ConnectionState::Connected)
+async fn try_dispatch_passive_notification(
+    app: &mut App,
+    session_manager: &mut session::CliSessionManager,
+    harness_controller: &HarnessController<tooling::ToolRuntime>,
+    turn_in_flight: bool,
+    tool_calls_in_flight: usize,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if !can_deliver_passive_notification(app, turn_in_flight, tool_calls_in_flight) {
+        return Ok(None);
+    }
+
+    let had_in_flight = harness_controller.current_in_flight_notification_id();
+    harness_controller
+        .dispatch_passive_notification_once(|delivery| async {
+            let prompt = delivery.prompt;
+            let session = ensure_hot_session(session_manager, WakeReason::PassiveNotification)
+                .await
+                .map_err(|error| error.to_string())?;
+            session
+                .send_text(&prompt)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+
+    let current_in_flight = harness_controller.current_in_flight_notification_id();
+    if had_in_flight.is_none()
+        && let Some(notification_id) = current_in_flight
+    {
+        app.sys(format!(
+            "[harness] delivered background notification {notification_id}"
+        ));
+        return Ok(Some(notification_id));
+    }
+    Ok(None)
+}
+
+fn can_deliver_passive_notification(
+    app: &App,
+    turn_in_flight: bool,
+    tool_calls_in_flight: usize,
+) -> bool {
+    !turn_in_flight
+        && tool_calls_in_flight == 0
         && app.pending.is_empty()
         && app.input.text().trim().is_empty()
+        && {
+            #[cfg(feature = "mic")]
+            {
+                !app.mic_on
+            }
+            #[cfg(not(feature = "mic"))]
+            {
+                true
+            }
+        }
+        && {
+            #[cfg(feature = "share-screen")]
+            {
+                !app.screen_on
+            }
+            #[cfg(not(feature = "share-screen"))]
+            {
+                true
+            }
+        }
+}
+
+fn can_enter_dormant(
+    app: &App,
+    turn_in_flight: bool,
+    tool_calls_in_flight: usize,
+    notification_in_flight: bool,
+) -> bool {
+    !turn_in_flight
+        && tool_calls_in_flight == 0
+        && !notification_in_flight
+        && app.pending.is_empty()
+        && {
+            #[cfg(feature = "mic")]
+            {
+                !app.mic_on
+            }
+            #[cfg(not(feature = "mic"))]
+            {
+                true
+            }
+        }
+        && {
+            #[cfg(feature = "share-screen")]
+            {
+                !app.screen_on
+            }
+            #[cfg(not(feature = "share-screen"))]
+            {
+                true
+            }
+        }
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
-async fn handle_key<S>(
+fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    session: &S,
-) -> Result<Option<AppCommand>, Box<dyn std::error::Error>>
-where
-    S: RuntimeSession,
-{
+) -> Result<Option<KeyAction>, Box<dyn std::error::Error>> {
     match key.code {
         KeyCode::Enter => {
             let raw = app.input.take_text();
@@ -431,13 +709,15 @@ where
             let trimmed = raw.trim().to_string();
             if let Some(command) = slash::parse(&trimmed) {
                 match command {
-                    Ok(command) => return Ok(app.apply_slash_command(command)),
+                    Ok(command) => {
+                        return Ok(app.apply_slash_command(command).map(KeyAction::Command));
+                    }
                     Err(err) => app.sys(format!("[slash] {err}")),
                 }
                 return Ok(None);
             }
             if !trimmed.is_empty() {
-                outbound::send_user_input(app, session, &trimmed).await?;
+                return Ok(Some(KeyAction::SendUserInput(trimmed)));
             }
         }
         KeyCode::Tab => {

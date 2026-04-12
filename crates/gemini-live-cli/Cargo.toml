@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+bytes = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 shlex = "1.3"
 tui-textarea = "0.7"

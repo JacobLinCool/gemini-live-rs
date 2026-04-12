@@ -183,7 +183,7 @@ fn bench_full_send_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_send_path");
     let pcm = pcm_bytes(CHUNK_40MS);
 
-    // With AudioEncoder (buffer reuse)
+    // Reusing a caller-owned AudioEncoder, but still building owned wire types.
     group.bench_function("audio_40ms_encoder", |b| {
         let mut enc = AudioEncoder::new();
         b.iter(|| {
@@ -203,7 +203,7 @@ fn bench_full_send_path(c: &mut Criterion) {
         });
     });
 
-    // Without AudioEncoder (current Session::send_audio path)
+    // Naive path: fresh base64 allocation every chunk before JSON assembly.
     group.bench_function("audio_40ms_naive", |b| {
         b.iter(|| {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm);

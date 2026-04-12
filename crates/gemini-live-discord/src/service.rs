@@ -8,13 +8,16 @@
 //! - auto-join voice when the configured owner enters the channel
 //! - auto-leave when the owner leaves
 //! - project Gemini output back into Discord chat and voice
+//! - deliver queued harness notifications as normal text turns, waking the
+//!   shared Live session on demand when needed
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gemini_live::ServerEvent;
-use gemini_live::types::{Content, Part};
+use gemini_live::types::{Content, FunctionResponse, Part};
+use gemini_live_harness::{Harness, HarnessToolCompletionDisposition, PassiveNotificationDelivery};
 use gemini_live_runtime::{
     ActivityKind, RuntimeEvent, RuntimeEventReceiver, RuntimeLifecycleEvent, RuntimeSendFailure,
     SessionLifecycleState, WakeReason,
@@ -32,11 +35,14 @@ use songbird::serenity::{SerenityInit, get as get_songbird};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::config::DiscordBotConfig;
+use crate::config::{DiscordBotConfig, harness_profile_name};
 use crate::error::DiscordServiceError;
 use crate::gateway::gateway_intents;
 use crate::policy::BotConversationScope;
-use crate::session::{DiscordSessionManager, new_session_manager};
+use crate::session::{
+    DiscordHarnessController, DiscordHarnessRuntimeBridge, DiscordSessionManager,
+    new_session_manager_with_harness,
+};
 use crate::setup::ensure_target_voice_channel;
 use crate::voice::{ActiveVoiceBridge, VoiceBridge, VoiceSessionPlan};
 
@@ -63,14 +69,25 @@ impl DiscordAgentService {
         &self.config
     }
 
-    pub fn prepare(&self) -> PreparedDiscordService {
-        let (session_manager, runtime_events) = new_session_manager(&self.config);
-        PreparedDiscordService {
+    pub fn prepare(&self) -> Result<PreparedDiscordService, DiscordServiceError> {
+        self.prepare_with_harness(Harness::open_profile(&harness_profile_name(
+            self.config.guild_id,
+        ))?)
+    }
+
+    pub(crate) fn prepare_with_harness(
+        &self,
+        harness: Harness,
+    ) -> Result<PreparedDiscordService, DiscordServiceError> {
+        let (session_manager, harness_controller, runtime_events) =
+            new_session_manager_with_harness(&self.config, harness.clone())?;
+        Ok(PreparedDiscordService {
             config: self.config.clone(),
             session_manager,
+            harness_controller,
             runtime_events,
             state: DiscordServiceState::default(),
-        }
+        })
     }
 }
 
@@ -78,6 +95,7 @@ impl DiscordAgentService {
 pub struct PreparedDiscordService {
     config: DiscordBotConfig,
     session_manager: DiscordSessionManager,
+    harness_controller: DiscordHarnessController,
     runtime_events: RuntimeEventReceiver,
     state: DiscordServiceState,
 }
@@ -90,17 +108,19 @@ struct SharedBotState {
 struct SharedBotStateInner {
     config: DiscordBotConfig,
     session_manager: Mutex<DiscordSessionManager>,
+    harness_controller: DiscordHarnessController,
     service_state: RwLock<DiscordServiceState>,
     pending_text_replies: Mutex<VecDeque<PendingTextReply>>,
+    turn_in_flight: Mutex<bool>,
     voice_bridge: Mutex<Option<ActiveVoiceBridge>>,
 }
-
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTextReply {
     channel_id: ChannelId,
     prompt: String,
+    notification_id: Option<String>,
 }
 
 struct RuntimeReplyState {
@@ -125,6 +145,7 @@ struct ChatReplyAccumulator {
     origin: ReplyOrigin,
     channel_id: ChannelId,
     user_input: String,
+    notification_id: Option<String>,
     output_transcription: String,
     model_text: String,
 }
@@ -156,7 +177,11 @@ impl PreparedDiscordService {
     }
 
     pub async fn run(self) -> Result<(), DiscordServiceError> {
-        let shared_state = SharedBotState::new(self.config.clone(), self.session_manager);
+        let shared_state = SharedBotState::new(
+            self.config.clone(),
+            self.session_manager,
+            self.harness_controller,
+        );
         let handler = DiscordGatewayHandler {
             state: shared_state.clone(),
         };
@@ -171,13 +196,19 @@ impl PreparedDiscordService {
         if let Err(error) = shared_state.ensure_target_channel(&http).await {
             tracing::warn!("initial Discord setup failed: {error}");
         }
+        let recovered_count = shared_state.recover_orphaned_notification_deliveries()?;
+        if recovered_count > 0 {
+            tracing::info!("requeued {recovered_count} orphaned harness notifications");
+        }
 
         let runtime_task =
             spawn_runtime_event_loop(shared_state.clone(), self.runtime_events, http);
         let idle_task = spawn_idle_dormancy_loop(shared_state.clone());
+        let notification_task = spawn_notification_delivery_loop(shared_state.clone());
         let start_result = client.start().await;
         runtime_task.abort();
         idle_task.abort();
+        notification_task.abort();
         let close_result = shared_state.close_runtime().await;
 
         start_result?;
@@ -187,13 +218,19 @@ impl PreparedDiscordService {
 }
 
 impl SharedBotState {
-    fn new(config: DiscordBotConfig, session_manager: DiscordSessionManager) -> Self {
+    fn new(
+        config: DiscordBotConfig,
+        session_manager: DiscordSessionManager,
+        harness_controller: DiscordHarnessController,
+    ) -> Self {
         Self {
             inner: Arc::new(SharedBotStateInner {
                 config,
                 session_manager: Mutex::new(session_manager),
+                harness_controller,
                 service_state: RwLock::new(DiscordServiceState::default()),
                 pending_text_replies: Mutex::new(VecDeque::new()),
+                turn_in_flight: Mutex::new(false),
                 voice_bridge: Mutex::new(None),
             }),
         }
@@ -201,6 +238,10 @@ impl SharedBotState {
 
     fn config(&self) -> &DiscordBotConfig {
         &self.inner.config
+    }
+
+    fn harness_controller(&self) -> &DiscordHarnessController {
+        &self.inner.harness_controller
     }
 
     async fn target_channel_id(&self) -> Option<ChannelId> {
@@ -263,13 +304,16 @@ impl SharedBotState {
             .push_back(PendingTextReply {
                 channel_id: message.channel_id,
                 prompt: prompt.clone(),
+                notification_id: None,
             });
+        self.set_turn_in_flight(true).await;
         let mut session_manager = self.inner.session_manager.lock().await;
         session_manager
             .ensure_hot(WakeReason::TextInput, Instant::now())
             .await?;
         if let Err(error) = session_manager.runtime().send_text(&prompt).await {
             let _ = self.inner.pending_text_replies.lock().await.pop_back();
+            self.sync_turn_state_after_reply_end().await;
             return Err(DiscordServiceError::from(error));
         }
         Ok(())
@@ -277,6 +321,19 @@ impl SharedBotState {
 
     async fn next_pending_text_reply(&self) -> Option<PendingTextReply> {
         self.inner.pending_text_replies.lock().await.pop_front()
+    }
+
+    async fn is_turn_in_flight(&self) -> bool {
+        *self.inner.turn_in_flight.lock().await
+    }
+
+    async fn set_turn_in_flight(&self, value: bool) {
+        *self.inner.turn_in_flight.lock().await = value;
+    }
+
+    async fn sync_turn_state_after_reply_end(&self) {
+        let pending = !self.inner.pending_text_replies.lock().await.is_empty();
+        self.set_turn_in_flight(pending).await;
     }
 
     async fn join_voice(
@@ -341,7 +398,7 @@ impl SharedBotState {
     async fn push_model_audio(&self, pcm_i16_le_24k: Vec<u8>) -> Result<(), DiscordServiceError> {
         let guard = self.inner.voice_bridge.lock().await;
         if let Some(bridge) = guard.as_ref() {
-            bridge.push_model_audio(pcm_i16_le_24k)?;
+            bridge.push_model_audio(pcm_i16_le_24k).await?;
         }
         Ok(())
     }
@@ -355,8 +412,22 @@ impl SharedBotState {
 
     async fn close_runtime(&self) -> Result<(), DiscordServiceError> {
         self.leave_voice().await?;
+        self.requeue_in_flight_notification()?;
         let mut session_manager = self.inner.session_manager.lock().await;
         session_manager.enter_dormant().await?;
+        self.set_turn_in_flight(false).await;
+        Ok(())
+    }
+
+    async fn send_tool_response(
+        &self,
+        responses: Vec<FunctionResponse>,
+    ) -> Result<(), DiscordServiceError> {
+        let session_manager = self.inner.session_manager.lock().await;
+        session_manager
+            .runtime()
+            .send_tool_response(responses)
+            .await?;
         Ok(())
     }
 
@@ -392,6 +463,69 @@ impl SharedBotState {
         if session_manager.idle_decision(now) == gemini_live_runtime::IdleDecision::EnterDormant {
             session_manager.enter_dormant().await?;
         }
+        Ok(())
+    }
+
+    fn recover_orphaned_notification_deliveries(&self) -> Result<usize, DiscordServiceError> {
+        Ok(self
+            .inner
+            .harness_controller
+            .recover_orphaned_deliveries()?)
+    }
+
+    async fn can_deliver_passive_notification(&self) -> bool {
+        self.target_channel_id().await.is_some() && !self.is_turn_in_flight().await
+    }
+
+    async fn deliver_passive_notification(
+        &self,
+        delivery: PassiveNotificationDelivery,
+    ) -> Result<(), DiscordServiceError> {
+        let Some(channel_id) = self.target_channel_id().await else {
+            return Ok(());
+        };
+
+        self.inner
+            .pending_text_replies
+            .lock()
+            .await
+            .push_back(PendingTextReply {
+                channel_id,
+                prompt: delivery.prompt.clone(),
+                notification_id: Some(delivery.notification.id),
+            });
+        self.set_turn_in_flight(true).await;
+
+        let send_result = {
+            let mut session_manager = self.inner.session_manager.lock().await;
+            session_manager
+                .ensure_hot(WakeReason::PassiveNotification, Instant::now())
+                .await?;
+            session_manager.runtime().send_text(&delivery.prompt).await
+        };
+        match send_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.inner.pending_text_replies.lock().await.pop_back();
+                self.sync_turn_state_after_reply_end().await;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn acknowledge_in_flight_notification(&self) -> Result<(), DiscordServiceError> {
+        let _ = self
+            .inner
+            .harness_controller
+            .acknowledge_in_flight_notification()?;
+        Ok(())
+    }
+
+    fn requeue_in_flight_notification(&self) -> Result<(), DiscordServiceError> {
+        let _ = self
+            .inner
+            .harness_controller
+            .requeue_in_flight_notification()?;
         Ok(())
     }
 }
@@ -435,11 +569,16 @@ impl RuntimeReplyState {
 }
 
 impl ChatReplyAccumulator {
-    fn for_text_turn(channel_id: ChannelId, prompt: String) -> Self {
+    fn for_text_turn(
+        channel_id: ChannelId,
+        prompt: String,
+        notification_id: Option<String>,
+    ) -> Self {
         Self {
             origin: ReplyOrigin::TextTurn,
             channel_id,
             user_input: prompt,
+            notification_id,
             output_transcription: String::new(),
             model_text: String::new(),
         }
@@ -450,6 +589,7 @@ impl ChatReplyAccumulator {
             origin: ReplyOrigin::VoiceTurn,
             channel_id,
             user_input: String::new(),
+            notification_id: None,
             output_transcription: String::new(),
             model_text: String::new(),
         }
@@ -574,12 +714,50 @@ fn spawn_runtime_event_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut reply_state = RuntimeReplyState::new();
-        while let Some(event) = runtime_events.recv().await {
-            if let Err(error) = handle_runtime_event(&state, &mut reply_state, &http, event).await {
-                tracing::warn!("runtime projection error: {error}");
+        let mut runtime_bridge =
+            DiscordHarnessRuntimeBridge::new(state.harness_controller().clone());
+
+        loop {
+            tokio::select! {
+                Some(event) = runtime_events.recv() => {
+                    if let Err(error) = handle_runtime_event(
+                        &state,
+                        &mut reply_state,
+                        &http,
+                        event,
+                        &runtime_bridge,
+                    ).await {
+                        tracing::warn!("runtime projection error: {error}");
+                    }
+                }
+                Some(forwarded) = runtime_bridge.recv_and_forward_tool_completion(|responses| state.send_tool_response(responses)) => {
+                    if let Err(error) = handle_tool_execution_forwarding(forwarded).await {
+                        tracing::warn!("tool completion handling failed: {error}");
+                    }
+                }
+                else => break,
             }
         }
+
+        state.harness_controller().abort_all_tool_calls();
     })
+}
+
+fn spawn_notification_delivery_loop(state: SharedBotState) -> JoinHandle<()> {
+    let harness_controller = state.inner.harness_controller.clone();
+    harness_controller.spawn_passive_notification_loop(
+        {
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                async move { state.can_deliver_passive_notification().await }
+            }
+        },
+        move |delivery| {
+            let state = state.clone();
+            async move { state.deliver_passive_notification(delivery).await }
+        },
+    )
 }
 
 async fn handle_runtime_event(
@@ -587,7 +765,9 @@ async fn handle_runtime_event(
     reply_state: &mut RuntimeReplyState,
     http: &Arc<Http>,
     event: RuntimeEvent,
+    runtime_bridge: &DiscordHarnessRuntimeBridge,
 ) -> Result<(), DiscordServiceError> {
+    let _ = runtime_bridge.handle_runtime_event(&event);
     match event {
         RuntimeEvent::Lifecycle(lifecycle) => {
             log_runtime_lifecycle(&lifecycle);
@@ -598,14 +778,54 @@ async fn handle_runtime_event(
         RuntimeEvent::Lagged { count } => {
             tracing::warn!("Gemini runtime event stream lagged by {count} events");
         }
-        RuntimeEvent::ToolCallStarted { id, name } => {
-            tracing::info!("tool call started: {name} ({id})");
+        RuntimeEvent::ToolCallRequested { call } => {
+            tracing::info!("tool call requested: {} ({})", call.name, call.id);
         }
-        RuntimeEvent::ToolCallFinished { id, name, outcome } => {
-            tracing::info!("tool call finished: {name} ({id}) -> {outcome:?}");
+        RuntimeEvent::ToolCallCancellationRequested { ids } => {
+            for call_id in ids {
+                tracing::info!("tool call cancelled: {call_id}");
+            }
         }
         RuntimeEvent::Server(server_event) => {
             handle_server_event(state, reply_state, http, server_event).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_tool_execution_forwarding(
+    forwarded: Result<
+        gemini_live_harness::HarnessToolForwardOutcome,
+        gemini_live_harness::HarnessToolForwardFailure<DiscordServiceError>,
+    >,
+) -> Result<(), DiscordServiceError> {
+    match forwarded {
+        Ok(outcome) => match outcome.disposition {
+            HarnessToolCompletionDisposition::Responded => {
+                tracing::info!(
+                    "tool call responded: {} ({})",
+                    outcome.call_name,
+                    outcome.call_id
+                );
+            }
+            HarnessToolCompletionDisposition::Failed => {
+                tracing::warn!(
+                    "tool call failed: {} ({})",
+                    outcome.call_name,
+                    outcome.call_id
+                );
+            }
+            HarnessToolCompletionDisposition::Cancelled => {
+                tracing::info!("tool call cancelled before response: {}", outcome.call_id);
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                "tool completion forwarding failed for {} ({}): {}",
+                error.call_name,
+                error.call_id,
+                error.source
+            );
         }
     }
     Ok(())
@@ -649,10 +869,14 @@ async fn handle_server_event(
                 }
                 state.record_completed_turn(&turn).await;
             }
+            state.acknowledge_in_flight_notification()?;
+            state.sync_turn_state_after_reply_end().await;
         }
         ServerEvent::Interrupted => {
             state.clear_model_audio().await;
             reply_state.discard_active();
+            state.requeue_in_flight_notification()?;
+            state.sync_turn_state_after_reply_end().await;
             tracing::debug!("Gemini Live turn was interrupted");
         }
         ServerEvent::InputTranscription(text) => {
@@ -681,6 +905,8 @@ async fn handle_server_event(
             );
         }
         ServerEvent::Closed { reason } => {
+            state.requeue_in_flight_notification()?;
+            state.set_turn_in_flight(false).await;
             tracing::warn!("Gemini Live session closed: {reason}");
         }
         ServerEvent::Error(error) => {
@@ -698,12 +924,14 @@ async fn ensure_active_reply(
         return reply_state.active.as_ref().map(|active| PendingTextReply {
             channel_id: active.channel_id,
             prompt: active.user_input.clone(),
+            notification_id: active.notification_id.clone(),
         });
     }
     if let Some(pending) = state.next_pending_text_reply().await {
         reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
             pending.channel_id,
             pending.prompt.clone(),
+            pending.notification_id.clone(),
         ));
         return Some(pending);
     }
@@ -712,6 +940,7 @@ async fn ensure_active_reply(
     Some(PendingTextReply {
         channel_id,
         prompt: String::new(),
+        notification_id: None,
     })
 }
 
@@ -851,9 +1080,16 @@ fn split_for_discord(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use gemini_live_harness::{
+        Harness, HarnessNotification, NotificationKind, NotificationStatus,
+        format_passive_notification_prompt,
+    };
     use serenity::all::{GuildId, UserId};
 
     use super::*;
+    use crate::config::DEFAULT_DISCORD_SYSTEM_INSTRUCTION;
 
     fn config() -> DiscordBotConfig {
         DiscordBotConfig {
@@ -863,15 +1099,32 @@ mod tests {
             owner_user_id: UserId::new(456),
             voice_channel_name: "gemini-live".into(),
             model: "models/custom-live".into(),
+            thinking_level: gemini_live::types::ThinkingLevel::High,
+            system_instruction: DEFAULT_DISCORD_SYSTEM_INSTRUCTION.into(),
+            voice_name: None,
             idle_timeout: Duration::from_secs(90),
             max_recent_turns: 24,
         }
     }
 
+    fn temp_harness() -> Harness {
+        let path = std::env::temp_dir().join(format!(
+            "gemini-live-discord-service-harness-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time before unix epoch")
+                .as_nanos()
+        ));
+        Harness::open(path).expect("open test harness")
+    }
+
     #[test]
     fn prepare_keeps_original_config() {
         let service = DiscordAgentService::new(config());
-        let prepared = service.prepare();
+        let prepared = service
+            .prepare_with_harness(temp_harness())
+            .expect("prepare service");
 
         assert_eq!(prepared.config().voice_channel_name, "gemini-live");
         assert_eq!(prepared.state(), &DiscordServiceState::default());
@@ -883,6 +1136,60 @@ mod tests {
             format_user_message_for_model_parts("alice", "hello"),
             "Discord user alice says: hello"
         );
+    }
+
+    #[test]
+    fn passive_notification_prompt_comes_from_harness() {
+        let prompt = format_passive_notification_prompt(&HarnessNotification {
+            id: "notification_1".into(),
+            kind: NotificationKind::TaskSucceeded,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            status: NotificationStatus::Queued,
+            task_id: Some("task_123".into()),
+            title: "Task completed".into(),
+            body: "The background work finished.".into(),
+            payload: None,
+            delivered_at_ms: None,
+            acknowledged_at_ms: None,
+        });
+        assert!(prompt.contains("Notification ID:"));
+        assert!(prompt.contains("Task ID: task_123"));
+        assert!(prompt.contains("Title: Task completed"));
+        assert!(prompt.contains("Body: The background work finished."));
+    }
+
+    #[tokio::test]
+    async fn passive_notification_gate_does_not_require_an_active_session() {
+        let prepared = DiscordAgentService::new(config())
+            .prepare_with_harness(temp_harness())
+            .expect("prepare service");
+        let state = SharedBotState::new(
+            prepared.config.clone(),
+            prepared.session_manager,
+            prepared.harness_controller,
+        );
+
+        state.inner.service_state.write().await.target_channel_id = Some(ChannelId::new(10));
+
+        assert!(state.can_deliver_passive_notification().await);
+    }
+
+    #[tokio::test]
+    async fn passive_notification_gate_still_blocks_while_a_turn_is_in_flight() {
+        let prepared = DiscordAgentService::new(config())
+            .prepare_with_harness(temp_harness())
+            .expect("prepare service");
+        let state = SharedBotState::new(
+            prepared.config.clone(),
+            prepared.session_manager,
+            prepared.harness_controller,
+        );
+
+        state.inner.service_state.write().await.target_channel_id = Some(ChannelId::new(10));
+        state.set_turn_in_flight(true).await;
+
+        assert!(!state.can_deliver_passive_notification().await);
     }
 
     #[test]
@@ -900,6 +1207,7 @@ mod tests {
         reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
             ChannelId::new(10),
             "Discord user alice says: hello".into(),
+            None,
         ));
         reply_state.append_output_transcription("spoken text turn");
 
@@ -922,6 +1230,7 @@ mod tests {
         reply_state.active = Some(ChatReplyAccumulator::for_text_turn(
             ChannelId::new(10),
             "Discord user alice says: hello".into(),
+            None,
         ));
         reply_state.append_model_text("hello from text");
 

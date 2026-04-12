@@ -73,6 +73,9 @@ Optional:
 
 - `GEMINI_MODEL`
   - Defaults to `models/gemini-3.1-flash-live-preview`
+- `GEMINI_THINKING_LEVEL`
+  - One of `minimal`, `low`, `medium`, `high`
+  - Defaults to `high`
 - `DISCORD_SESSION_IDLE_TIMEOUT_SECS`
   - Defaults to `600`
 - `DISCORD_SESSION_MAX_RECENT_TURNS`
@@ -102,7 +105,9 @@ INTENT` enabled for this bot. Without it, startup fails with
 The crate now includes:
 
 - environment parsing and validation
+- guild-scoped harness profiles for persisted session preferences and durable harness state
 - a shared audio-first Gemini Live session bootstrap
+- a built-in local `set_timer` tool for exercising harness background-task and notification flow
 - a built-in system instruction that grounds the model in Discord voice/chat
 - server-side context compression and initial-history support for fresh wakes
 - Discord gateway handling through `serenity`
@@ -115,7 +120,6 @@ What is still intentionally narrow:
 - one configured guild only
 - one configured owner only
 - one shared Live session only
-- no persistence layer beyond environment variables
 - no slash-command surface yet
 
 ## Module Map

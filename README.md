@@ -12,8 +12,8 @@ High-performance Rust client for the [Gemini Multimodal Live API](https://ai.goo
 - **Strongly typed** — every wire message has a Rust struct; serde handles the JSON mapping
 - **Session management** — automatic reconnection with exponential backoff, session resumption, GoAway handling
 - **Streaming-first** — `send_audio` / `send_video` / `send_text` for real-time input; event stream for output
-- **Performance-conscious** — zero-allocation `AudioEncoder` for the hot path; buffer-reuse design throughout
-- **Tool calling** — built-in support for function calls, cancellations, and scheduling modes
+- **Performance-conscious** — `AudioEncoder` reuses hot-path encoding buffers, and benchmark coverage exists for the hottest codec/audio paths
+- **Tool calling** — typed function calls, cancellations, and built-in `googleSearch`; Gemini 2.5 async scheduling semantics remain under audit
 - **Clone-friendly sessions** — `Session` is cheaply cloneable; multiple tasks can send and receive concurrently
 - **Vertex-ready transport** — first-class Vertex AI Live routing via regional endpoints and bearer-token auth
 
@@ -140,13 +140,14 @@ Each layer's public API and design notes are documented in source code doc comme
 
 ## Workspace Crates
 
-This repository now has six focused crates instead of treating the CLI as the
+This repository now has seven focused crates instead of treating the CLI as the
 accidental home for reusable host logic:
 
 | Crate | Role |
 |-------|------|
 | `gemini-live` | Wire-level Live API client |
 | `gemini-live-runtime` | Reusable staged-setup and managed runtime orchestration |
+| `gemini-live-harness` | Durable harness state, passive notifications, and shared host-tool execution policy |
 | `gemini-live-tools` | Reusable low-coupling tool families such as workspace inspection/execution |
 | `gemini-live-io` | Reusable desktop mic / speaker / screen adapters |
 | `gemini-live-cli` | Interactive desktop TUI built on the shared crates above |
@@ -160,7 +161,7 @@ For convenience:
 session.send_audio(&pcm_i16_le_bytes).await?;
 ```
 
-For maximum performance (zero allocation on the hot path):
+For lower-overhead audio encoding with encoder buffer reuse:
 
 ```rust
 let mut enc = AudioEncoder::new();
@@ -174,6 +175,10 @@ loop {
     session.send_raw(msg).await?;
 }
 ```
+
+This avoids the extra base64-string allocation in `Session::send_audio`, but
+the current full message-building and JSON-encoding path still performs owned
+allocations; see [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Tool Calling
 
@@ -294,6 +299,7 @@ gemini-live update
 | `docs/cli.md` | CLI usage, commands, feature flags, and architecture |
 | `docs/protocol.md` | Upstream API reference (endpoints, lifecycle, VAD, session limits, model differences) |
 | `docs/design.md` | Architecture decisions and performance goals |
+| `docs/runtime-sequence.md` | Cross-layer sequence diagram for host/runtime/harness/session behavior |
 | `docs/roadmap.md` | Planned work, known gaps, tech debt |
 | `docs/testing.md` | Test inventory and instructions |
 

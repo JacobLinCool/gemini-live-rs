@@ -25,7 +25,10 @@ pub mod session;
 pub mod setup;
 pub mod voice;
 
-pub use config::{DEFAULT_GEMINI_MODEL, DiscordBotConfig};
+pub use config::{
+    DEFAULT_DISCORD_SYSTEM_INSTRUCTION, DEFAULT_GEMINI_MODEL, DiscordBotConfig,
+    DiscordProfileConfig, harness_profile_name,
+};
 pub use error::{ConfigError, DiscordServiceError};
 pub use gateway::gateway_intents;
 pub use policy::BotConversationScope;

@@ -9,7 +9,7 @@ applications need but should not keep re-implementing:
 - staged versus active `setup`
 - a testable `SessionDriver` boundary
 - managed event forwarding into one runtime stream
-- tool-call execution and cancellation
+- tool-call request and cancellation fanout
 - process-local conversation memory
 - hot versus dormant session lifecycle management
 
@@ -18,7 +18,7 @@ applications need but should not keep re-implementing:
 ```mermaid
 flowchart LR
     Host["Host application"] --> SM["SessionManager<br/>hot/dormant policy<br/>rehydration"]
-    SM --> MR["ManagedRuntime<br/>event forwarding<br/>tool orchestration"]
+    SM --> MR["ManagedRuntime<br/>event forwarding<br/>tool-call fanout"]
     MR --> LR["LiveRuntime<br/>staged setup<br/>session switchover"]
     LR --> Driver["SessionDriver"]
     Driver --> Session["gemini_live::Session"]
@@ -30,7 +30,7 @@ Choose the lowest layer that matches the host you are building:
 | Type | Owns | Use it when |
 | --- | --- | --- |
 | `LiveRuntime` | `desired_setup`, `active_setup`, connect/apply/close | You already own your own async event loop and tool execution, and only need staged setup plus exact session switchover. |
-| `ManagedRuntime` | `LiveRuntime` plus session forwarding, tool tasks, resume-handle tracking, runtime events | You want one host-facing event stream and do not want to duplicate `toolCall` handling. |
+| `ManagedRuntime` | `LiveRuntime` plus session forwarding, tool-call request fanout, resume-handle tracking, runtime events | You want one host-facing event stream and do not want to duplicate session forwarding or resume-handle tracking. |
 | `SessionManager` | `ManagedRuntime` plus idle policy, process-local memory, dormant/hot transitions, fresh-session rehydration | Your product keeps a process alive longer than one hot Live session and needs to wake, sleep, and restore context. |
 
 ## Lifecycle
@@ -40,7 +40,7 @@ all behavior behind one opaque state machine because the policy boundaries are
 different:
 
 - `LiveRuntime` owns setup staging and session replacement.
-- `ManagedRuntime` owns async task orchestration around one active session.
+- `ManagedRuntime` owns async forwarding around one active session.
 - `SessionManager` owns host policy for dormancy, wake-up, and rehydration.
 
 ### `LiveRuntime`: staged setup and exact session switchover
@@ -77,14 +77,14 @@ This layer intentionally does not own:
 - resume-handle persistence
 - dormant/hot policy
 
-### `ManagedRuntime`: one active session plus background tasks
+### `ManagedRuntime`: one active session plus tool-call fanout
 
 `ManagedRuntime` wraps `LiveRuntime` and owns the async machinery that hosts
 would otherwise duplicate:
 
 - one forwarder task for the active session
 - interception of `toolCall` and `toolCallCancellation`
-- tool execution through `ToolAdapter`
+- conversion into host-facing tool request events
 - conversion into `RuntimeEvent`
 - tracking the latest `sessionResumptionUpdate` handle
 - generation-based filtering so late non-lifecycle events from a superseded
@@ -95,17 +95,13 @@ sequenceDiagram
     participant API as Gemini API
     participant Session as RuntimeSession
     participant MR as ManagedRuntime
-    participant Tool as ToolAdapter
     participant Host
 
     API-->>Session: ServerEvent / toolCall / sessionResumptionUpdate
     Session-->>MR: RuntimeSessionObservation
     alt toolCall
-        MR->>Host: RuntimeEvent::ToolCallStarted
-        MR->>Tool: execute(call)
-        Tool-->>MR: FunctionResponse
-        MR->>Session: send_tool_response(...)
-        MR->>Host: RuntimeEvent::ToolCallFinished
+        MR->>Host: RuntimeEvent::ToolCallRequested
+        Host->>Session: send_tool_response(...)
     else ordinary server event
         MR->>Host: RuntimeEvent::Server(...)
     end
@@ -189,8 +185,7 @@ use gemini_live::session::SessionConfig;
 use gemini_live::transport::{Auth, TransportConfig};
 use gemini_live::types::{Content, Part, SetupConfig};
 use gemini_live_runtime::{
-    GeminiSessionDriver, ManagedRuntime, NoopToolAdapter, Patch, RuntimeConfig, RuntimeEvent,
-    SetupPatch,
+    GeminiSessionDriver, ManagedRuntime, Patch, RuntimeConfig, RuntimeEvent, SetupPatch,
 };
 
 #[tokio::main]
@@ -209,8 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let (mut runtime, mut events) =
-        ManagedRuntime::new(config, GeminiSessionDriver, NoopToolAdapter);
+    let (mut runtime, mut events) = ManagedRuntime::new(config, GeminiSessionDriver);
 
     runtime.connect().await?;
     runtime.send_text("hello").await?;
@@ -245,8 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Source Map
 
 - [`src/runtime.rs`](src/runtime.rs): staged setup and session replacement
-- [`src/managed.rs`](src/managed.rs): forwarder task, tool orchestration, runtime events
+- [`src/managed.rs`](src/managed.rs): forwarder task, tool-call fanout, runtime events
 - [`src/session_manager.rs`](src/session_manager.rs): dormant/hot lifecycle and rehydration
 - [`src/memory.rs`](src/memory.rs): process-local conversation memory
 - [`src/driver.rs`](src/driver.rs): testable boundary above `gemini_live::Session`
-- [`src/tool.rs`](src/tool.rs): host tool execution contract
+- `gemini-live-harness`: host-fed tool provider/executor contracts and harness-owned inline-budget orchestration

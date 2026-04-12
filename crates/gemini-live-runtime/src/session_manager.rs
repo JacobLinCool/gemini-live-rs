@@ -1,7 +1,7 @@
-//! Higher-level session lifecycle skeleton above [`ManagedRuntime`](crate::ManagedRuntime).
+//! Higher-level session lifecycle skeleton above [`ManagedRuntime`].
 //!
-//! The managed runtime already owns active-session forwarding and tool
-//! orchestration. Hosts that want lower-power behavior still need one more
+//! The managed runtime already owns active-session forwarding and tool-call
+//! request fanout. Hosts that want lower-power behavior still need one more
 //! layer that decides when a Live session should be hot, when it can go
 //! dormant, and how a fresh session should be rehydrated from process-local
 //! memory.
@@ -18,7 +18,6 @@ use crate::driver::SessionDriver;
 use crate::error::RuntimeError;
 use crate::managed::ManagedRuntime;
 use crate::memory::{ConversationMemoryStore, ConversationSnapshot};
-use crate::tool::ToolAdapter;
 
 /// High-level lifecycle state for a host-managed Live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +35,7 @@ pub enum WakeReason {
     TextInput,
     VoiceJoin,
     VoiceActivity,
+    PassiveNotification,
     ExplicitRefresh,
 }
 
@@ -90,25 +90,23 @@ pub struct WakeOutcome {
 }
 
 /// Reusable session lifecycle coordinator.
-pub struct SessionManager<D, A, M>
+pub struct SessionManager<D, M>
 where
     D: SessionDriver,
-    A: ToolAdapter,
     M: ConversationMemoryStore,
 {
-    runtime: ManagedRuntime<D, A>,
+    runtime: ManagedRuntime<D>,
     memory: M,
     idle_policy: IdlePolicy,
     lifecycle_state: SessionLifecycleState,
 }
 
-impl<D, A, M> SessionManager<D, A, M>
+impl<D, M> SessionManager<D, M>
 where
     D: SessionDriver,
-    A: ToolAdapter,
     M: ConversationMemoryStore,
 {
-    pub fn new(runtime: ManagedRuntime<D, A>, memory: M, idle_policy: IdlePolicy) -> Self {
+    pub fn new(runtime: ManagedRuntime<D>, memory: M, idle_policy: IdlePolicy) -> Self {
         Self {
             runtime,
             memory,
@@ -117,11 +115,11 @@ where
         }
     }
 
-    pub fn runtime(&self) -> &ManagedRuntime<D, A> {
+    pub fn runtime(&self) -> &ManagedRuntime<D> {
         &self.runtime
     }
 
-    pub fn runtime_mut(&mut self) -> &mut ManagedRuntime<D, A> {
+    pub fn runtime_mut(&mut self) -> &mut ManagedRuntime<D> {
         &mut self.runtime
     }
 
@@ -289,7 +287,7 @@ fn map_wake_reason_to_activity(reason: WakeReason) -> ActivityKind {
     match reason {
         WakeReason::TextInput => ActivityKind::TextInput,
         WakeReason::VoiceJoin | WakeReason::VoiceActivity => ActivityKind::VoiceInput,
-        WakeReason::ExplicitRefresh => ActivityKind::ToolCall,
+        WakeReason::PassiveNotification | WakeReason::ExplicitRefresh => ActivityKind::ToolCall,
     }
 }
 
@@ -315,8 +313,6 @@ mod tests {
     use crate::config::RuntimeConfig;
     use crate::driver::{RuntimeSession, SessionDriver};
     use crate::memory::{ConversationMemoryStore, InMemoryConversationMemory};
-    use crate::tool::NoopToolAdapter;
-
     #[derive(Clone, Default)]
     struct FakeDriver {
         connects: Arc<Mutex<Vec<SessionConfig>>>,
@@ -407,7 +403,7 @@ mod tests {
             connects: Arc::default(),
             sessions: Arc::new(Mutex::new(VecDeque::from([first_session]))),
         };
-        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver, NoopToolAdapter);
+        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver);
         let memory = InMemoryConversationMemory::new();
         let mut snapshot = memory.load_snapshot();
         snapshot.push_recent_turn(
@@ -443,7 +439,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(VecDeque::from([FakeSession::default()]))),
         };
         let connects = Arc::clone(&driver.connects);
-        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver, NoopToolAdapter);
+        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver);
         let memory = InMemoryConversationMemory::new();
         let issued_at = Instant::now();
         let mut snapshot = memory.load_snapshot();
@@ -480,7 +476,7 @@ mod tests {
             sessions: Arc::new(Mutex::new(VecDeque::from([FakeSession::default()]))),
         };
         let connects = Arc::clone(&driver.connects);
-        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver, NoopToolAdapter);
+        let (runtime, _events) = ManagedRuntime::new(runtime_config(), driver);
         let memory = InMemoryConversationMemory::new();
         let mut manager = SessionManager::new(runtime, memory, IdlePolicy::default());
 

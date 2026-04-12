@@ -5,4 +5,5 @@
 //! state, or persistence. Concrete applications choose which tool families to
 //! expose and how to combine them with host-local capabilities.
 
+pub mod timer;
 pub mod workspace;

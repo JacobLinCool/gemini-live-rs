@@ -4,9 +4,7 @@
 //! testable without a running terminal, audio device, or Live session.
 
 use gemini_live::types::ServerEvent;
-use gemini_live_runtime::{
-    RuntimeEvent, RuntimeLifecycleEvent, RuntimeSendOperation, ToolCallOutcome,
-};
+use gemini_live_runtime::{RuntimeEvent, RuntimeLifecycleEvent, RuntimeSendOperation};
 
 use crate::input;
 use crate::slash;
@@ -412,21 +410,13 @@ impl App {
                 self.sys(format!("[lagged] missed {count} events"));
                 ServerEventEffect::None
             }
-            RuntimeEvent::ToolCallStarted { id, name } => {
-                self.sys(format!("[tool] requested {name} ({id})"));
+            RuntimeEvent::ToolCallRequested { call } => {
+                self.sys(format!("[tool] requested {} ({})", call.name, call.id));
                 ServerEventEffect::None
             }
-            RuntimeEvent::ToolCallFinished { id, name, outcome } => {
-                match outcome {
-                    ToolCallOutcome::Responded => {
-                        self.sys(format!("[tool] responded: {name} ({id})"));
-                    }
-                    ToolCallOutcome::Cancelled => {
-                        self.sys(format!("[tool] cancelled {id}"));
-                    }
-                    ToolCallOutcome::Failed { reason } => {
-                        self.sys(format!("[tool error] {name} ({id}): {reason}"));
-                    }
+            RuntimeEvent::ToolCallCancellationRequested { ids } => {
+                for id in ids {
+                    self.sys(format!("[tool] cancelled {id}"));
                 }
                 ServerEventEffect::None
             }
@@ -604,14 +594,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tool_failure_is_rendered_as_system_message() {
+    fn runtime_tool_request_is_rendered_as_system_message() {
         let mut app = App::new("test", ToolProfile::default(), None);
 
-        let effect = app.apply_runtime_event(RuntimeEvent::ToolCallFinished {
-            id: "call-1".into(),
-            name: "read_file".into(),
-            outcome: ToolCallOutcome::Failed {
-                reason: "boom".into(),
+        let effect = app.apply_runtime_event(RuntimeEvent::ToolCallRequested {
+            call: gemini_live::types::FunctionCallRequest {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                args: serde_json::json!({}),
             },
         });
 
@@ -619,7 +609,7 @@ mod tests {
         assert!(
             app.messages
                 .iter()
-                .any(|msg| msg.text.contains("[tool error] read_file (call-1): boom"))
+                .any(|msg| msg.text.contains("[tool] requested read_file (call-1)"))
         );
     }
 

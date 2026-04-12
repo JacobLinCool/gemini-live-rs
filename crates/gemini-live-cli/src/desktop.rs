@@ -35,10 +35,7 @@ use crate::profile;
 #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
 use crate::startup::StartupConfig;
 #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
-use crate::tooling;
-
-#[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
-type CliRuntime = ManagedRuntime<GeminiSessionDriver, tooling::ToolRuntime>;
+type CliRuntime = ManagedRuntime<GeminiSessionDriver>;
 
 #[cfg(any(feature = "mic", feature = "speak"))]
 pub(crate) struct DesktopAudio {

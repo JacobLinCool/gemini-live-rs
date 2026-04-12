@@ -22,9 +22,10 @@
 //! `VERTEX_AUTH=static` uses `VERTEX_AI_ACCESS_TOKEN`. `VERTEX_AUTH=adc`
 //! requires building the CLI with the Cargo feature `vertex-auth`.
 //!
-//! Session switchover, runtime event fanout, and tool-call orchestration are
-//! delegated to the workspace `gemini-live-runtime` crate, while desktop media
-//! adapters live in `gemini-live-io`.
+//! Session switchover and runtime event fanout are delegated to the workspace
+//! `gemini-live-runtime` crate. Shared tool execution contracts, harness-owned
+//! budget wrapping, and durable background tasks live in `gemini-live-harness`,
+//! while desktop media adapters live in `gemini-live-io`.
 //!
 //! `main.rs` is now the CLI entrypoint and event-loop composition layer.
 //! Keep product semantics next to their natural homes:
@@ -55,10 +56,18 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use app::{App, AppCommand, summarize_optional_system_instruction};
+use app::{App, AppCommand, ConnectionState, summarize_optional_system_instruction};
 use desktop_control::DesktopControlPort;
-use gemini_live_runtime::{GeminiSessionDriver, ManagedRuntime, RuntimeSession};
-use startup::{StartupConfig, build_cli_setup, build_runtime_config, resolve_startup_config};
+use gemini_live::ServerEvent;
+use gemini_live_harness::{
+    Harness, HarnessController, HarnessRuntimeBridge, HarnessToolBudget,
+    HarnessToolCompletionDisposition,
+};
+use gemini_live_runtime::{GeminiSessionDriver, ManagedRuntime, RuntimeEvent, RuntimeSession};
+use startup::{
+    StartupConfig, build_cli_setup_with_tools, build_runtime_config_with_tools,
+    resolve_startup_config,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_BIN_NAME"))]
@@ -81,7 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(CliCommand::Update) => return update::run().await,
         Some(CliCommand::Config) => {
-            println!("{}", profile::config_file_path()?.display());
+            println!(
+                "{}",
+                profile::config_file_path(cli.profile.as_deref())?.display()
+            );
             return Ok(());
         }
         None => {}
@@ -117,6 +129,7 @@ async fn run(
     mut profile_store: profile::ProfileStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir()?;
+    let harness = profile_store.open_harness()?;
     #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
     let (desktop_control_port_impl, mut desktop_control_server) = desktop_control::channel();
     #[cfg(any(feature = "mic", feature = "speak", feature = "share-screen"))]
@@ -130,12 +143,24 @@ async fn run(
         startup.tool_profile,
         startup.system_instruction.clone(),
     );
-    app.refresh_completions();
-    let initial_tool_runtime = tooling::ToolRuntime::new(
+    let initial_host_tools = tooling::ToolRuntime::new(
         workspace_root.clone(),
         app.active_tools,
         desktop_control_port.clone(),
     )?;
+    let mut active_harness_controller =
+        build_harness_controller(harness.clone(), initial_host_tools)?;
+    let mut active_harness_runtime_bridge =
+        HarnessRuntimeBridge::new(active_harness_controller.clone());
+    let recovered_notifications = active_harness_controller.recover_orphaned_deliveries()?;
+    if recovered_notifications > 0 {
+        app.sys(format!(
+            "requeued {} orphaned harness notifications",
+            recovered_notifications
+        ));
+    }
+    app.refresh_completions();
+    let initial_setup_tools = active_harness_controller.advertised_tools();
 
     app.sys(format!("profile: {}", startup.profile_name));
     app.sys(format!("tools active: {}", app.active_tools.summary()));
@@ -144,15 +169,16 @@ async fn run(
         summarize_optional_system_instruction(app.active_system_instruction.as_deref())
     ));
     let (mut runtime, mut runtime_events) = ManagedRuntime::new(
-        build_runtime_config(
+        build_runtime_config_with_tools(
             &startup,
-            app.active_tools,
+            initial_setup_tools,
             app.active_system_instruction.as_deref(),
         ),
         GeminiSessionDriver,
-        initial_tool_runtime,
     );
     runtime.connect().await?;
+    let mut notification_ticks =
+        tokio::time::interval(active_harness_controller.notification_interval());
 
     #[cfg(any(feature = "mic", feature = "speak"))]
     let mut audio = desktop::DesktopAudio::new()?;
@@ -238,18 +264,29 @@ async fn run(
                             if !app.has_staged_session_changes() {
                                 app.sys("session config already active".into());
                             } else {
-                                runtime.replace_desired_setup(build_cli_setup(
-                                    &startup,
-                                    app.desired_tools,
-                                    app.desired_system_instruction.as_deref(),
-                                ));
-                                runtime.replace_desired_tool_adapter(tooling::ToolRuntime::new(
+                                let desired_host_tools = tooling::ToolRuntime::new(
                                     workspace_root.clone(),
                                     app.desired_tools,
                                     desktop_control_port.clone(),
-                                )?);
+                                )?;
+                                let desired_harness_controller = build_harness_controller(
+                                    harness.clone(),
+                                    desired_host_tools,
+                                )?;
+                                let desired_setup_tools =
+                                    desired_harness_controller.advertised_tools();
+                                runtime.replace_desired_setup(build_cli_setup_with_tools(
+                                    &startup,
+                                    desired_setup_tools,
+                                    app.desired_system_instruction.as_deref(),
+                                ));
                                 match runtime.apply().await {
                                     Ok(_report) => {
+                                        active_harness_controller = desired_harness_controller;
+                                        active_harness_runtime_bridge =
+                                            HarnessRuntimeBridge::new(
+                                                active_harness_controller.clone(),
+                                            );
                                         app.mark_session_config_applied();
                                         profile_store.set_tool_profile(app.active_tools)?;
                                         profile_store.set_system_instruction(
@@ -275,12 +312,72 @@ async fn run(
                 }
             }
             Some(event) = runtime_events.recv() => {
+                let _ = active_harness_runtime_bridge.handle_runtime_event(&event);
+                match event.clone() {
+                    RuntimeEvent::Server(ServerEvent::TurnComplete) => {
+                        let _ = active_harness_controller.acknowledge_in_flight_notification()?;
+                    }
+                    RuntimeEvent::Server(ServerEvent::Interrupted) => {
+                        let _ = active_harness_controller.requeue_in_flight_notification()?;
+                    }
+                    _ => {}
+                }
                 let effect = app.apply_runtime_event(event);
                 #[cfg(any(feature = "mic", feature = "speak"))]
                 audio.apply_server_effect(effect);
                 #[cfg(not(any(feature = "mic", feature = "speak")))]
                 match effect {
                     app::ServerEventEffect::None => {}
+                }
+            }
+            Some(forwarded) = active_harness_runtime_bridge.recv_and_forward_tool_completion(|responses| runtime.send_tool_response(responses)) => {
+                match forwarded {
+                    Ok(outcome) => match outcome.disposition {
+                        HarnessToolCompletionDisposition::Responded => {
+                            app.sys(format!("[tool] responded: {} ({})", outcome.call_name, outcome.call_id));
+                        }
+                        HarnessToolCompletionDisposition::Failed => {
+                            app.sys(format!(
+                                "[tool error] {} ({}): execution failed",
+                                outcome.call_name, outcome.call_id
+                            ));
+                        }
+                        HarnessToolCompletionDisposition::Cancelled => {
+                            app.sys(format!("[tool] cancelled {}", outcome.call_id));
+                        }
+                    },
+                    Err(error) => {
+                        app.sys(format!(
+                            "[tool error] {} ({}): {}",
+                            error.call_name, error.call_id, error.source
+                        ));
+                    }
+                }
+            }
+            _ = notification_ticks.tick() => {
+                if can_deliver_passive_notification(&app) {
+                    let had_in_flight =
+                        active_harness_controller.current_in_flight_notification_id();
+                    let runtime_ref = &runtime;
+                    active_harness_controller
+                        .dispatch_passive_notification_once(&|delivery| {
+                            let prompt = delivery.prompt;
+                            async move {
+                                runtime_ref
+                                    .send_text(&prompt)
+                                .await
+                                .map_err(|error| error.to_string())
+                            }
+                        })
+                        .await?;
+                    if had_in_flight.is_none()
+                        && let Some(notification_id) =
+                            active_harness_controller.current_in_flight_notification_id()
+                    {
+                        app.sys(format!(
+                            "[harness] delivered background notification {notification_id}"
+                        ));
+                    }
                 }
             }
             Some(captured) = mic_event => {
@@ -298,8 +395,23 @@ async fn run(
         }
     }
 
+    active_harness_controller.abort_all_tool_calls();
     runtime.close().await?;
     Ok(())
+}
+
+fn build_harness_controller(
+    harness: Harness,
+    host_tools: tooling::ToolRuntime,
+) -> Result<HarnessController<tooling::ToolRuntime>, gemini_live_harness::HarnessError> {
+    HarnessController::with_host_tools(harness, host_tools)
+        .map(|controller| controller.with_budget(HarnessToolBudget::default()))
+}
+
+fn can_deliver_passive_notification(app: &App) -> bool {
+    matches!(app.connection_state, ConnectionState::Connected)
+        && app.pending.is_empty()
+        && app.input.text().trim().is_empty()
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────

@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use gemini_live::types::{FunctionCallRequest, FunctionDeclaration, FunctionResponse, Tool};
-use gemini_live_runtime::{ToolAdapter, ToolDescriptor, ToolExecutionError, ToolKind};
+use gemini_live_harness::{
+    ToolCapability, ToolDescriptor, ToolExecutionError, ToolExecutor, ToolKind, ToolProvider,
+    ToolSpecification,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -71,6 +74,7 @@ impl WorkspaceToolId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct WorkspaceToolSelection {
     pub list_files: bool,
     pub read_file: bool,
@@ -361,7 +365,7 @@ impl WorkspaceToolAdapter {
     }
 }
 
-impl ToolAdapter for WorkspaceToolAdapter {
+impl ToolProvider for WorkspaceToolAdapter {
     fn advertised_tools(&self) -> Option<Vec<Tool>> {
         self.selection.build_live_tool().map(|tool| vec![tool])
     }
@@ -377,6 +381,16 @@ impl ToolAdapter for WorkspaceToolAdapter {
             .collect()
     }
 
+    fn specifications(&self) -> Vec<ToolSpecification> {
+        WorkspaceToolId::ALL
+            .into_iter()
+            .filter(|tool| self.selection.is_enabled(*tool))
+            .map(|tool| ToolSpecification::new(tool.function_name(), ToolCapability::INLINE_ONLY))
+            .collect()
+    }
+}
+
+impl ToolExecutor for WorkspaceToolAdapter {
     fn execute<'a>(
         &'a self,
         call: FunctionCallRequest,

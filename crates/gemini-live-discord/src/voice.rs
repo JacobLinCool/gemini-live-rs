@@ -11,6 +11,12 @@
 //! into Gemini Live on every 20 ms Discord voice tick and fills gaps with zero
 //! PCM. That keeps turn boundary detection on the Gemini side instead of
 //! inventing a second VAD policy in Discord land.
+//!
+//! The playback side intentionally does the opposite: it only creates a
+//! Discord playback track once model audio actually arrives, then lets that
+//! track end as soon as the buffered PCM is drained. This keeps Discord's
+//! speaking indicator aligned with real model speech instead of a permanent
+//! silence stream.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -18,15 +24,16 @@ use std::io::{
     Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Seek, SeekFrom,
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gemini_live_runtime::{GeminiSessionHandle, RuntimeSession};
 use serenity::all::{ChannelId, GuildId, UserId};
 use songbird::events::context_data::VoiceTick;
-use songbird::events::{CoreEvent, Event, EventContext, EventHandler};
+use songbird::events::{CoreEvent, Event, EventContext, EventData, EventHandler, TrackEvent};
 use songbird::input::codecs::{get_codec_registry, get_probe};
 use songbird::input::core::io::MediaSource;
 use songbird::input::{Input, RawAdapter};
-use songbird::tracks::TrackHandle;
+use songbird::tracks::{Track, TrackHandle};
 use songbird::{Call, Songbird};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -72,12 +79,19 @@ struct VoiceTickHandler {
     shared: Arc<BridgeShared>,
 }
 
+struct PlaybackTrackEndHandler {
+    call: Arc<tokio::sync::Mutex<Call>>,
+    playback: Arc<PlaybackShared>,
+    generation: u64,
+}
+
 struct PlaybackSource {
     shared: Arc<PlaybackShared>,
 }
 
 struct PlaybackShared {
     state: Mutex<PlaybackState>,
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -85,14 +99,17 @@ struct PlaybackState {
     queued: VecDeque<Vec<u8>>,
     queued_offset: usize,
     active: bool,
+    track: Option<TrackHandle>,
+    track_generation: Option<u64>,
+    next_track_generation: u64,
 }
 
 pub struct ActiveVoiceBridge {
     manager: DiscordVoiceManager,
     plan: VoiceSessionPlan,
     session: GeminiSessionHandle,
+    call: Arc<tokio::sync::Mutex<Call>>,
     playback: Arc<PlaybackShared>,
-    playback_track: TrackHandle,
     owner_audio_task: JoinHandle<()>,
 }
 
@@ -123,6 +140,7 @@ impl VoiceBridge {
                 active: true,
                 ..Default::default()
             }),
+            start_lock: tokio::sync::Mutex::new(()),
         });
         let shared = Arc::new(BridgeShared {
             owner_user_id: self.plan.owner_user_id,
@@ -130,8 +148,7 @@ impl VoiceBridge {
             ssrc_to_user: Mutex::new(HashMap::new()),
         });
 
-        let playback_track =
-            configure_call(&call, Arc::clone(&shared), Arc::clone(&playback)).await?;
+        configure_call(&call, Arc::clone(&shared)).await?;
 
         let owner_audio_task = spawn_owner_audio_forwarder(session.clone(), owner_audio_rx);
 
@@ -139,8 +156,8 @@ impl VoiceBridge {
             manager: self.manager,
             plan: self.plan,
             session,
+            call,
             playback,
-            playback_track,
             owner_audio_task,
         })
     }
@@ -152,17 +169,22 @@ impl ActiveVoiceBridge {
     }
 
     pub fn clear_model_audio(&self) {
-        clear_playback_queue(&self.playback);
+        stop_playback(&self.playback);
     }
 
-    pub fn push_model_audio(&self, pcm_i16_le_24k: Vec<u8>) -> Result<(), DiscordServiceError> {
+    pub async fn push_model_audio(
+        &self,
+        pcm_i16_le_24k: Vec<u8>,
+    ) -> Result<(), DiscordServiceError> {
         let pcm_f32_le = pcm_i16le_to_f32le_bytes(&pcm_i16_le_24k);
-        let mut state = self.playback.state.lock().expect("playback state lock");
-        if !state.active {
-            return Err(DiscordServiceError::VoicePlaybackClosed);
+        {
+            let mut state = self.playback.state.lock().expect("playback state lock");
+            if !state.active {
+                return Err(DiscordServiceError::VoicePlaybackClosed);
+            }
+            state.queued.push_back(pcm_f32_le);
         }
-        state.queued.push_back(pcm_f32_le);
-        Ok(())
+        ensure_playback_track(&self.call, &self.playback).await
     }
 
     pub async fn shutdown(self) -> Result<(), DiscordServiceError> {
@@ -170,13 +192,11 @@ impl ActiveVoiceBridge {
             manager,
             plan,
             session,
+            call: _call,
             playback,
-            playback_track,
             owner_audio_task,
         } = self;
-        clear_playback_queue(&playback);
-        playback.state.lock().expect("playback state lock").active = false;
-        let _ = playback_track.stop();
+        deactivate_playback(&playback);
         owner_audio_task.abort();
         let _ = session.audio_stream_end().await;
         manager.remove(plan.guild_id).await?;
@@ -214,6 +234,26 @@ impl EventHandler for VoiceTickHandler {
     }
 }
 
+#[serenity::async_trait]
+impl EventHandler for PlaybackTrackEndHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let EventContext::Track(track_states) = ctx else {
+            return Some(Event::Cancel);
+        };
+        let Some((state, _handle)) = track_states.first().copied() else {
+            return Some(Event::Cancel);
+        };
+        if !state.playing.is_done() {
+            return Some(Event::Cancel);
+        }
+        if let Err(error) = finish_playback_track(self.generation, &self.call, &self.playback).await
+        {
+            tracing::warn!("failed to finalize Discord playback track: {error}");
+        }
+        Some(Event::Cancel)
+    }
+}
+
 impl PlaybackSource {
     fn new(shared: Arc<PlaybackShared>) -> Self {
         Self { shared }
@@ -222,19 +262,43 @@ impl PlaybackSource {
 
 impl Drop for PlaybackSource {
     fn drop(&mut self) {
-        clear_playback_queue(&self.shared);
-        self.shared
-            .state
-            .lock()
-            .expect("playback state lock")
-            .active = false;
+        stop_playback(&self.shared);
     }
 }
 
-fn clear_playback_queue(playback: &PlaybackShared) {
+fn stop_playback(playback: &PlaybackShared) {
+    let track = {
+        let mut state = playback.state.lock().expect("playback state lock");
+        state.queued.clear();
+        state.queued_offset = 0;
+        state.track_generation = None;
+        state.track.take()
+    };
+    if let Some(track) = track {
+        let _ = track.stop();
+    }
+}
+
+fn deactivate_playback(playback: &PlaybackShared) {
+    let track = {
+        let mut state = playback.state.lock().expect("playback state lock");
+        state.active = false;
+        state.queued.clear();
+        state.queued_offset = 0;
+        state.track_generation = None;
+        state.track.take()
+    };
+    if let Some(track) = track {
+        let _ = track.stop();
+    }
+}
+
+fn clear_track_after_failed_start(playback: &PlaybackShared, generation: u64) {
     let mut state = playback.state.lock().expect("playback state lock");
-    state.queued.clear();
-    state.queued_offset = 0;
+    if state.track_generation == Some(generation) {
+        state.track_generation = None;
+        state.track = None;
+    }
 }
 
 impl Read for PlaybackSource {
@@ -250,11 +314,7 @@ impl Read for PlaybackSource {
                     buf[written..written + to_copy].copy_from_slice(&remaining[..to_copy]);
                     (to_copy, state.queued_offset + to_copy >= front.len())
                 }
-                None => {
-                    buf[written..].fill(0);
-                    written = buf.len();
-                    break;
-                }
+                None => break,
             };
             written += to_copy;
             state.queued_offset += to_copy;
@@ -290,8 +350,7 @@ impl MediaSource for PlaybackSource {
 async fn configure_call(
     call: &Arc<tokio::sync::Mutex<Call>>,
     shared: Arc<BridgeShared>,
-    playback: Arc<PlaybackShared>,
-) -> Result<TrackHandle, DiscordServiceError> {
+) -> Result<(), DiscordServiceError> {
     let mut call = call.lock().await;
     call.deafen(false).await?;
     call.mute(false).await?;
@@ -307,9 +366,7 @@ async fn configure_call(
             shared: Arc::clone(&shared),
         },
     );
-
-    let input = build_ready_live_pcm_input(playback).await?;
-    Ok(call.play_only_input(input))
+    Ok(())
 }
 
 fn build_live_pcm_input(stream: impl MediaSource + 'static, sample_rate: u32) -> Input {
@@ -325,6 +382,91 @@ async fn build_ready_live_pcm_input(
         .make_playable_async(get_codec_registry(), get_probe())
         .await
         .map_err(Into::into)
+}
+
+async fn ensure_playback_track(
+    call: &Arc<tokio::sync::Mutex<Call>>,
+    playback: &Arc<PlaybackShared>,
+) -> Result<(), DiscordServiceError> {
+    let _start_guard = playback.start_lock.lock().await;
+    let generation = {
+        let mut state = playback.state.lock().expect("playback state lock");
+        if !state.active || state.queued.is_empty() || state.track_generation.is_some() {
+            return Ok(());
+        }
+        let generation = state.next_track_generation;
+        state.next_track_generation += 1;
+        state.track_generation = Some(generation);
+        generation
+    };
+
+    let track = match start_playback_track(call, Arc::clone(playback), generation).await {
+        Ok(track) => track,
+        Err(error) => {
+            clear_track_after_failed_start(playback, generation);
+            return Err(error);
+        }
+    };
+
+    let should_stop_immediately = {
+        let mut state = playback.state.lock().expect("playback state lock");
+        if state.track_generation != Some(generation) {
+            true
+        } else if !state.active || state.queued.is_empty() {
+            state.track_generation = None;
+            true
+        } else {
+            state.track = Some(track.clone());
+            false
+        }
+    };
+
+    if should_stop_immediately {
+        let _ = track.stop();
+    }
+    Ok(())
+}
+
+async fn start_playback_track(
+    call: &Arc<tokio::sync::Mutex<Call>>,
+    playback: Arc<PlaybackShared>,
+    generation: u64,
+) -> Result<TrackHandle, DiscordServiceError> {
+    let input = build_ready_live_pcm_input(Arc::clone(&playback)).await?;
+    let mut track = Track::from(input);
+    track.events.add_event(
+        EventData::new(
+            Event::Track(TrackEvent::End),
+            PlaybackTrackEndHandler {
+                call: Arc::clone(call),
+                playback,
+                generation,
+            },
+        ),
+        Duration::ZERO,
+    );
+    let mut call = call.lock().await;
+    Ok(call.play_only(track))
+}
+
+async fn finish_playback_track(
+    generation: u64,
+    call: &Arc<tokio::sync::Mutex<Call>>,
+    playback: &Arc<PlaybackShared>,
+) -> Result<(), DiscordServiceError> {
+    let should_restart = {
+        let mut state = playback.state.lock().expect("playback state lock");
+        if state.track_generation != Some(generation) {
+            return Ok(());
+        }
+        state.track_generation = None;
+        state.track = None;
+        state.active && !state.queued.is_empty()
+    };
+    if should_restart {
+        ensure_playback_track(call, playback).await?;
+    }
+    Ok(())
 }
 
 fn spawn_owner_audio_forwarder(
@@ -475,9 +617,11 @@ mod tests {
     async fn playback_source_can_be_made_playable_and_stream_multiple_packets() {
         let playback = Arc::new(PlaybackShared {
             state: Mutex::new(PlaybackState {
+                queued: VecDeque::from([vec![0; 4_096]]),
                 active: true,
                 ..Default::default()
             }),
+            start_lock: tokio::sync::Mutex::new(()),
         });
         let mut input =
             build_live_pcm_input(PlaybackSource::new(playback), MODEL_AUDIO_SAMPLE_RATE)
@@ -491,13 +635,11 @@ mod tests {
             .live_mut()
             .and_then(|live| live.parsed_mut())
             .expect("parsed live input");
-        for _ in 0..3 {
-            let packet = parsed
-                .format
-                .next_packet()
-                .expect("live playback source should not end");
-            assert!(!packet.buf().is_empty());
-        }
+        let packet = parsed
+            .format
+            .next_packet()
+            .expect("live playback source should emit buffered audio");
+        assert!(!packet.buf().is_empty());
     }
 
     #[test]
@@ -547,20 +689,46 @@ mod tests {
     }
 
     #[test]
-    fn clear_playback_queue_resets_buffered_audio() {
+    fn stop_playback_resets_buffered_audio() {
         let playback = PlaybackShared {
             state: Mutex::new(PlaybackState {
                 queued: VecDeque::from([vec![1, 2, 3], vec![4, 5]]),
                 queued_offset: 2,
                 active: true,
+                track_generation: Some(7),
+                ..Default::default()
             }),
+            start_lock: tokio::sync::Mutex::new(()),
         };
 
-        clear_playback_queue(&playback);
+        stop_playback(&playback);
 
         let state = playback.state.lock().expect("playback state lock");
         assert!(state.queued.is_empty());
         assert_eq!(state.queued_offset, 0);
         assert!(state.active);
+        assert!(state.track.is_none());
+        assert!(state.track_generation.is_none());
+    }
+
+    #[test]
+    fn playback_source_returns_eof_after_buffer_drains() {
+        let playback = Arc::new(PlaybackShared {
+            state: Mutex::new(PlaybackState {
+                queued: VecDeque::from([vec![1, 2, 3]]),
+                active: true,
+                ..Default::default()
+            }),
+            start_lock: tokio::sync::Mutex::new(()),
+        });
+        let mut source = PlaybackSource::new(playback);
+        let mut buf = [0_u8; 3];
+
+        let first = source.read(&mut buf).expect("first read");
+        let second = source.read(&mut buf).expect("second read");
+
+        assert_eq!(first, 3);
+        assert_eq!(buf, [1, 2, 3]);
+        assert_eq!(second, 0);
     }
 }

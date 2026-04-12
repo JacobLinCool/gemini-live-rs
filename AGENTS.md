@@ -122,6 +122,11 @@ Project-specific docs are split by change-trigger:
 - [`docs/design.md`](docs/design.md)
   Content: architecture diagram, performance goals, and ADRs.
   Update when: we refactor our architecture.
+- [`docs/runtime-sequence.md`](docs/runtime-sequence.md)
+  Content: cross-layer sequence diagrams for host/runtime/harness/session
+  interactions, including background tools and passive notifications.
+  Update when: we change cross-layer control flow, ordering, or failure
+  semantics.
 - [`docs/roadmap.md`](docs/roadmap.md)
   Content: planned work, performance gaps, and tech debt; the single source of
   truth for "identified but not done".

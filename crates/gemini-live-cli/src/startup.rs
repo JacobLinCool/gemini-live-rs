@@ -12,6 +12,7 @@
 //! The built-in desktop session template currently opts into:
 //!
 //! - `responseModalities = ["AUDIO"]`
+//! - `thinkingConfig = { thinkingLevel = "high" }`
 //! - `inputAudioTranscription = {}`
 //! - `outputAudioTranscription = {}`
 //! - `sessionResumption = {}`
@@ -19,6 +20,7 @@
 //! Then the selected profile overlays:
 //!
 //! - model / backend / credentials
+//! - optional thinking level override
 //! - staged tool profile
 //! - microphone / speaker auto-start flags
 //! - optional screen-share auto-start settings
@@ -40,7 +42,7 @@ use gemini_live::session::{ReconnectPolicy, SessionConfig};
 use gemini_live::transport::{Auth, Endpoint, TransportConfig};
 use gemini_live::types::{
     AudioTranscriptionConfig, Content, GenerationConfig, MediaResolution, Modality, Part,
-    SessionResumptionConfig, SetupConfig,
+    SessionResumptionConfig, SetupConfig, ThinkingConfig, ThinkingLevel, Tool,
 };
 use gemini_live_runtime::RuntimeConfig;
 
@@ -48,6 +50,7 @@ use crate::profile;
 use crate::tooling::ToolProfile;
 
 const DEFAULT_GEMINI_MODEL: &str = "models/gemini-3.1-flash-live-preview";
+const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::High;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
@@ -82,6 +85,7 @@ enum VertexTransportAuthPlan {
 pub(crate) struct StartupConfig {
     pub(crate) profile_name: String,
     pub(crate) model: String,
+    pub(crate) thinking_level: ThinkingLevel,
     pub(crate) system_instruction: Option<String>,
     pub(crate) transport: TransportConfig,
     backend: Backend,
@@ -100,6 +104,7 @@ pub(crate) struct StartupConfig {
 struct PersistedProfileInput {
     backend: Backend,
     model: String,
+    thinking_level: ThinkingLevel,
     system_instruction: Option<String>,
     tools: ToolProfile,
     #[cfg(feature = "mic")]
@@ -153,6 +158,7 @@ pub(crate) fn resolve_startup_config(
         TransportPlan::Vertex { location, .. } => Some(location.clone()),
     };
     let model = resolve_model(&env, stored_profile, backend)?;
+    let thinking_level = resolve_thinking_level(&env, stored_profile)?;
     let system_instruction = env("GEMINI_SYSTEM_INSTRUCTION")
         .or_else(|| stored_profile.system_instruction.clone())
         .filter(|value| !value.trim().is_empty());
@@ -169,6 +175,7 @@ pub(crate) fn resolve_startup_config(
         &PersistedProfileInput {
             backend,
             model: model.clone(),
+            thinking_level,
             system_instruction: system_instruction.clone(),
             tools: tool_profile,
             #[cfg(feature = "mic")]
@@ -184,6 +191,7 @@ pub(crate) fn resolve_startup_config(
     Ok(StartupConfig {
         profile_name: profile_name.to_string(),
         model,
+        thinking_level,
         system_instruction,
         transport,
         backend,
@@ -199,29 +207,33 @@ pub(crate) fn resolve_startup_config(
     })
 }
 
-pub(crate) fn build_runtime_config(
+pub(crate) fn build_runtime_config_with_tools(
     startup: &StartupConfig,
-    tools: ToolProfile,
+    tools: Option<Vec<Tool>>,
     system_instruction: Option<&str>,
 ) -> RuntimeConfig {
     RuntimeConfig {
         session: SessionConfig {
             transport: startup.transport.clone(),
-            setup: build_cli_setup(startup, tools, system_instruction),
+            setup: build_cli_setup_with_tools(startup, tools, system_instruction),
             reconnect: ReconnectPolicy::default(),
         },
     }
 }
 
-pub(crate) fn build_cli_setup(
+pub(crate) fn build_cli_setup_with_tools(
     startup: &StartupConfig,
-    tools: ToolProfile,
+    tools: Option<Vec<Tool>>,
     system_instruction: Option<&str>,
 ) -> SetupConfig {
     SetupConfig {
         model: startup.model.clone(),
         generation_config: Some(GenerationConfig {
             response_modalities: Some(vec![Modality::Audio]),
+            thinking_config: Some(ThinkingConfig {
+                thinking_level: Some(startup.thinking_level),
+                ..Default::default()
+            }),
             media_resolution: Some(MediaResolution::MediaResolutionHigh),
             ..Default::default()
         }),
@@ -229,7 +241,7 @@ pub(crate) fn build_cli_setup(
         input_audio_transcription: Some(AudioTranscriptionConfig {}),
         output_audio_transcription: Some(AudioTranscriptionConfig {}),
         session_resumption: Some(SessionResumptionConfig::default()),
-        tools: tools.build_live_tools(),
+        tools,
         ..Default::default()
     }
 }
@@ -289,6 +301,26 @@ fn resolve_model(
             stored_profile.model.clone(),
             "VERTEX_MODEL",
         ),
+    }
+}
+
+fn resolve_thinking_level(
+    env: &impl Fn(&str) -> Option<String>,
+    stored_profile: &profile::ProfileConfig,
+) -> Result<ThinkingLevel, CliConfigError> {
+    match env("GEMINI_THINKING_LEVEL") {
+        Some(raw) => {
+            if raw.trim().is_empty() {
+                return Err(CliConfigError::new(
+                    "GEMINI_THINKING_LEVEL must not be empty",
+                ));
+            }
+            raw.parse::<ThinkingLevel>()
+                .map_err(|error| CliConfigError::new(format!("GEMINI_THINKING_LEVEL {error}")))
+        }
+        None => Ok(stored_profile
+            .thinking_level
+            .unwrap_or(DEFAULT_THINKING_LEVEL)),
     }
 }
 
@@ -382,6 +414,7 @@ fn build_persisted_profile(
     profile::ProfileConfig {
         backend: backend_value,
         model: Some(input.model.clone()),
+        thinking_level: Some(input.thinking_level),
         system_instruction: input.system_instruction.clone(),
         gemini_api_key,
         vertex_location,
@@ -606,6 +639,7 @@ mod tests {
         let stored = profile::ProfileConfig {
             backend: Some(profile::PersistentBackend::Gemini),
             model: Some("models/from-profile".into()),
+            thinking_level: Some(ThinkingLevel::Low),
             system_instruction: Some("Profile instruction".into()),
             gemini_api_key: Some("profile-key".into()),
             ..Default::default()
@@ -614,6 +648,7 @@ mod tests {
         let startup = resolve_startup_config(
             env(&[
                 ("GEMINI_MODEL", "models/from-env"),
+                ("GEMINI_THINKING_LEVEL", "medium"),
                 ("GEMINI_SYSTEM_INSTRUCTION", "Env instruction"),
                 ("GEMINI_API_KEY", "env-key"),
             ]),
@@ -623,6 +658,7 @@ mod tests {
         .expect("startup config");
 
         assert_eq!(startup.model, "models/from-env");
+        assert_eq!(startup.thinking_level, ThinkingLevel::Medium);
         assert_eq!(
             startup.system_instruction.as_deref(),
             Some("Env instruction")
@@ -631,5 +667,72 @@ mod tests {
             Auth::ApiKey(key) => assert_eq!(key, "env-key"),
             other => panic!("unexpected auth: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_setup_defaults_to_high_thinking_level() {
+        let startup = resolve_startup_config(
+            env(&[("GEMINI_API_KEY", "test-key")]),
+            &empty_profile(),
+            "default",
+        )
+        .expect("startup config");
+
+        let setup = build_cli_setup_with_tools(&startup, None, None);
+        let generation_config = setup.generation_config.as_ref().expect("generation config");
+        assert_eq!(
+            generation_config
+                .thinking_config
+                .as_ref()
+                .and_then(|config| config.thinking_level.as_ref()),
+            Some(&ThinkingLevel::High)
+        );
+    }
+
+    #[test]
+    fn startup_uses_profile_thinking_level_when_env_is_missing() {
+        let stored = profile::ProfileConfig {
+            gemini_api_key: Some("profile-key".into()),
+            thinking_level: Some(ThinkingLevel::Minimal),
+            ..Default::default()
+        };
+
+        let startup =
+            resolve_startup_config(env(&[]), &stored, "persisted").expect("startup config");
+
+        assert_eq!(startup.thinking_level, ThinkingLevel::Minimal);
+    }
+
+    #[test]
+    fn rejects_invalid_thinking_level() {
+        let err = resolve_startup_config(
+            env(&[
+                ("GEMINI_API_KEY", "test-key"),
+                ("GEMINI_THINKING_LEVEL", "extreme"),
+            ]),
+            &empty_profile(),
+            "default",
+        )
+        .expect_err("invalid thinking level should fail");
+
+        assert!(
+            err.to_string()
+                .contains("GEMINI_THINKING_LEVEL unsupported thinking level")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_thinking_level() {
+        let err = resolve_startup_config(
+            env(&[
+                ("GEMINI_API_KEY", "test-key"),
+                ("GEMINI_THINKING_LEVEL", "   "),
+            ]),
+            &empty_profile(),
+            "default",
+        )
+        .expect_err("empty thinking level should fail");
+
+        assert_eq!(err.to_string(), "GEMINI_THINKING_LEVEL must not be empty");
     }
 }

@@ -1,6 +1,7 @@
 //! Error types for the Discord host layer.
 
 use gemini_live::SessionError;
+use gemini_live_harness::HarnessError;
 use gemini_live_runtime::RuntimeError;
 use serenity::all::GatewayError;
 use songbird::error::JoinError;
@@ -18,6 +19,10 @@ pub enum ConfigError {
     InvalidDiscordId { key: &'static str, value: String },
     #[error("environment variable {key} must be a positive integer, got {value:?}")]
     InvalidPositiveInt { key: &'static str, value: String },
+    #[error("environment variable {key} must be one of minimal, low, medium, high, got {value:?}")]
+    InvalidThinkingLevel { key: &'static str, value: String },
+    #[error("failed to load or persist the Discord harness profile: {detail}")]
+    ProfileStore { detail: String },
 }
 
 /// Host-layer service errors.
@@ -25,6 +30,8 @@ pub enum ConfigError {
 pub enum DiscordServiceError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
@@ -41,15 +48,9 @@ pub enum DiscordServiceError {
     SongbirdUnavailable,
     #[error("voice playback bridge is closed")]
     VoicePlaybackClosed,
-    #[error("TODO(gemini-live-discord): {detail}")]
-    Unimplemented { detail: &'static str },
 }
 
 impl DiscordServiceError {
-    pub fn unimplemented(detail: &'static str) -> Self {
-        Self::Unimplemented { detail }
-    }
-
     pub fn startup_hint(&self) -> Option<&'static str> {
         match self {
             Self::Serenity(error)

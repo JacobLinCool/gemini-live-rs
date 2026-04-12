@@ -12,7 +12,11 @@ use futures_util::future::BoxFuture;
 use gemini_live::types::{
     FunctionCallRequest, FunctionDeclaration, FunctionResponse, GoogleSearchTool, Tool,
 };
-use gemini_live_runtime::{ToolAdapter, ToolDescriptor, ToolKind};
+use gemini_live_harness::{
+    ToolCapability, ToolDescriptor, ToolExecutionError, ToolExecutor, ToolKind, ToolProvider,
+    ToolSpecification,
+};
+use gemini_live_tools::timer::{TimerToolAdapter, TimerToolId, TimerToolSelection};
 use gemini_live_tools::workspace::{WorkspaceToolAdapter, WorkspaceToolId, WorkspaceToolSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,6 +28,7 @@ use crate::desktop_control::{DesktopControlAction, DesktopControlPort};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolId {
     GoogleSearch,
+    Timer,
     ListFiles,
     ReadFile,
     RunCommand,
@@ -38,6 +43,7 @@ pub enum ToolId {
 impl ToolId {
     pub const ALL: &'static [Self] = &[
         Self::GoogleSearch,
+        Self::Timer,
         Self::ListFiles,
         Self::ReadFile,
         Self::RunCommand,
@@ -52,6 +58,7 @@ impl ToolId {
     pub fn key(self) -> &'static str {
         match self {
             Self::GoogleSearch => "google-search",
+            Self::Timer => TimerToolId::SetTimer.key(),
             Self::ListFiles => WorkspaceToolId::ListFiles.key(),
             Self::ReadFile => WorkspaceToolId::ReadFile.key(),
             Self::RunCommand => WorkspaceToolId::RunCommand.key(),
@@ -75,6 +82,7 @@ impl ToolId {
     pub fn summary(self) -> &'static str {
         match self {
             Self::GoogleSearch => "Google-managed web search",
+            Self::Timer => TimerToolId::SetTimer.summary(),
             Self::ListFiles => WorkspaceToolId::ListFiles.summary(),
             Self::ReadFile => WorkspaceToolId::ReadFile.summary(),
             Self::RunCommand => WorkspaceToolId::RunCommand.summary(),
@@ -90,6 +98,7 @@ impl ToolId {
     fn as_workspace_tool(self) -> Option<WorkspaceToolId> {
         match self {
             Self::GoogleSearch => None,
+            Self::Timer => None,
             Self::ListFiles => Some(WorkspaceToolId::ListFiles),
             Self::ReadFile => Some(WorkspaceToolId::ReadFile),
             Self::RunCommand => Some(WorkspaceToolId::RunCommand),
@@ -164,6 +173,7 @@ impl DesktopToolId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct DesktopToolSelection {
     #[cfg(feature = "mic")]
     pub desktop_microphone: bool,
@@ -256,9 +266,11 @@ impl DesktopToolSelection {
 #[derive(Default)]
 pub struct ToolProfile {
     pub google_search: bool,
-    #[serde(flatten)]
+    #[serde(flatten, default)]
+    pub timer: TimerToolSelection,
+    #[serde(flatten, default)]
     pub workspace: WorkspaceToolSelection,
-    #[serde(flatten)]
+    #[serde(flatten, default)]
     pub desktop: DesktopToolSelection,
 }
 
@@ -266,6 +278,7 @@ impl ToolProfile {
     pub fn is_enabled(self, tool: ToolId) -> bool {
         match tool {
             ToolId::GoogleSearch => self.google_search,
+            ToolId::Timer => self.timer.is_enabled(TimerToolId::SetTimer),
             _ if tool.as_workspace_tool().is_some() => self
                 .workspace
                 .is_enabled(tool.as_workspace_tool().expect("workspace tool id")),
@@ -282,6 +295,7 @@ impl ToolProfile {
                 self.google_search = enabled;
                 changed
             }
+            ToolId::Timer => self.timer.set(TimerToolId::SetTimer, enabled),
             _ if tool.as_workspace_tool().is_some() => self.workspace.set(
                 tool.as_workspace_tool().expect("workspace tool id"),
                 enabled,
@@ -318,6 +332,7 @@ impl ToolProfile {
             tools.push(Tool::GoogleSearch(GoogleSearchTool {}));
         }
         let mut functions = self.workspace.function_declarations();
+        functions.extend(self.timer.function_declarations());
         functions.extend(self.desktop.function_declarations());
         if !functions.is_empty() {
             tools.push(Tool::FunctionDeclarations(functions));
@@ -372,6 +387,7 @@ pub fn catalog_lines(active: ToolProfile, desired: ToolProfile) -> Vec<String> {
 #[derive(Clone)]
 pub struct ToolRuntime {
     profile: ToolProfile,
+    timer: TimerToolAdapter,
     workspace: WorkspaceToolAdapter,
     desktop_control: Option<Arc<dyn DesktopControlPort>>,
 }
@@ -384,12 +400,16 @@ impl ToolRuntime {
     ) -> io::Result<Self> {
         Ok(Self {
             profile,
+            timer: TimerToolAdapter::new(profile.timer),
             workspace: WorkspaceToolAdapter::new(workspace_root, profile.workspace)?,
             desktop_control,
         })
     }
 
     pub async fn execute_call(&self, call: FunctionCallRequest) -> FunctionResponse {
+        if TimerToolId::from_function_name(call.name.as_str()).is_some() {
+            return self.timer.execute_call(call).await;
+        }
         if WorkspaceToolId::from_function_name(call.name.as_str()).is_some() {
             return self.workspace.execute_call(call).await;
         }
@@ -444,7 +464,7 @@ impl ToolRuntime {
     }
 }
 
-impl ToolAdapter for ToolRuntime {
+impl ToolProvider for ToolRuntime {
     fn advertised_tools(&self) -> Option<Vec<Tool>> {
         self.profile.build_live_tools()
     }
@@ -465,10 +485,48 @@ impl ToolAdapter for ToolRuntime {
             .collect()
     }
 
+    fn specifications(&self) -> Vec<ToolSpecification> {
+        let mut specs = self.timer.specifications();
+
+        specs.extend(
+            WorkspaceToolId::ALL
+                .into_iter()
+                .filter(|tool| self.profile.workspace.is_enabled(*tool))
+                .map(|tool| {
+                    let capability = if tool == WorkspaceToolId::RunCommand {
+                        ToolCapability::BACKGROUND_CONTINUABLE
+                    } else {
+                        ToolCapability::INLINE_ONLY
+                    };
+                    ToolSpecification::new(tool.function_name(), capability)
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        specs.extend(
+            DesktopToolId::ALL
+                .iter()
+                .copied()
+                .filter(|tool| self.profile.desktop.is_enabled(*tool))
+                .flat_map(|tool| {
+                    tool.function_names()
+                        .iter()
+                        .copied()
+                        .map(|function_name| {
+                            ToolSpecification::new(function_name, ToolCapability::INLINE_ONLY)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+        );
+        specs
+    }
+}
+
+impl ToolExecutor for ToolRuntime {
     fn execute<'a>(
         &'a self,
         call: FunctionCallRequest,
-    ) -> BoxFuture<'a, Result<FunctionResponse, gemini_live_runtime::ToolExecutionError>> {
+    ) -> BoxFuture<'a, Result<FunctionResponse, ToolExecutionError>> {
         Box::pin(async move { Ok(self.execute_call(call).await) })
     }
 }
@@ -707,6 +765,7 @@ mod tests {
     fn tool_profile_builds_google_search_and_local_functions() {
         let profile = ToolProfile {
             google_search: true,
+            timer: TimerToolSelection { timer: true },
             workspace: WorkspaceToolSelection {
                 list_files: true,
                 read_file: true,
@@ -723,7 +782,7 @@ mod tests {
                     .iter()
                     .map(|function| function.name.as_str())
                     .collect::<Vec<_>>();
-                assert_eq!(names, vec!["list_files", "read_file"]);
+                assert_eq!(names, vec!["list_files", "read_file", "set_timer"]);
             }
             other => panic!("unexpected tool variant: {other:?}"),
         }
@@ -753,6 +812,7 @@ mod tests {
         let profile = ToolProfile::default();
 
         assert!(!profile.google_search);
+        assert!(profile.timer.timer);
         assert!(profile.workspace.list_files);
         assert!(profile.workspace.read_file);
         assert!(!profile.workspace.run_command);
@@ -762,6 +822,19 @@ mod tests {
         assert!(profile.desktop.desktop_speaker);
         #[cfg(feature = "share-screen")]
         assert!(profile.desktop.desktop_screen_share);
+    }
+
+    #[test]
+    fn tool_profile_deserializes_missing_timer_field_to_default_enabled() {
+        let profile: ToolProfile = serde_json::from_value(json!({
+            "googleSearch": false,
+            "listFiles": true,
+            "readFile": true,
+            "runCommand": false,
+        }))
+        .expect("deserialize tool profile");
+
+        assert!(profile.timer.timer);
     }
 
     #[test]

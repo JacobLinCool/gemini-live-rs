@@ -33,6 +33,8 @@ Missing or incomplete functionality relative to the upstream API.
 | F-7 | Broader built-in Live tools | Typed `googleSearch` setup coverage now exists. Extend the typed tool surface to the remaining built-in tools the Live API exposes on supported models/endpoints, instead of forcing callers into raw JSON. | Medium |
 | F-8 | Gemini 2.5-only session features | `enableAffectiveDialog` and `proactivity.proactiveAudio` are explicit Live API capabilities on Gemini 2.5 (`v1alpha`). Audit and add missing typed coverage. | Medium |
 | F-9 | Async function-calling wire semantics audit | Official docs put `behavior=NON_BLOCKING` on function declarations and `scheduling` inside `FunctionResponse.response`. Audit our types and examples against the current wire contract. | High |
+| F-10 | Harness host lifecycle parity | CLI and Discord now both use `gemini-live-harness` for durable profiles, background tasks, and passive notifications. The remaining work is to keep wake/dormancy behavior, startup reconciliation, and passive-notification delivery semantics aligned across hosts so future hosts do not drift back into bespoke orchestration paths. | Medium |
+| F-12 | Harness notification source metadata | Durable notifications still do not record structured origin metadata such as `source_kind`, `source_id`, or a future dedupe key. Add at least source identity fields so prompt formatting, debugging, and later de-duplication do not rely on free-form notification text alone. | Medium |
 
 ## CLI Product
 
@@ -43,6 +45,7 @@ end-user application.
 |----|------|-------------|----------|
 | C-1 | Richer session profiles | Persistent named profiles now cover backend, model, system instruction, credentials, tools, and device auto-start state. Extend them to first-class voice and richer session-template controls. | High |
 | C-4 | Distribution truthfulness | `update.rs` advertises Linux ARM64, but the release workflow does not ship that artifact. Align updater targets with published binaries. | Medium |
+| C-5 | Profile management surface | Harness-managed named profiles now back CLI and Discord state, but there is still no explicit host-facing surface for listing, renaming, deleting, or copying profiles. Add that only after notification metadata and host lifecycle semantics are in better shape, so we do not widen the product surface before the underlying recovery model is solid. | Low |
 
 ## Testing
 

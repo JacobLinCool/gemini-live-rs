@@ -6,31 +6,47 @@
 
 ## Implemented Tests
 
-| Level | Test item | Count |
-|---|---|---|
-| **Unit** | Codec: serialize / deserialize round-trip | 22 |
-| **Unit** | AudioEncoder: f32/i16 → base64 correctness | 5 |
-| **Unit** | ReconnectPolicy: backoff calculation | 1 |
-| **Unit** | Session: status encoding, resume handle tracking, resumed-handshake setup shaping | 4 |
-| **Unit** | Transport: URL construction, default config | 4 |
-| **Unit** | IO crate: desktop audio resample helpers | 2 |
-| **Unit** | Runtime crate: staged setup patching + resumed/fresh apply semantics + managed runtime event/tool orchestration + hot/dormant session-manager coverage | 13 |
-| **Unit** | CLI: startup config + top-level CLI parsing + slash parser/completion + render status + app reducer + outbound send flow + tool catalog | 30 |
-| **Unit** | Discord crate: config parsing + target-channel planning + owner/text routing policy + runtime bootstrap + service helper behavior | 31 |
-| **Doc** | `lib.rs` usage example, `AudioEncoder` example | 4 |
-| **Bench** | Criterion hot-path suite (`cargo bench -p gemini-live`) | 1 |
+Current checked-in coverage is organized by crate and behavior surface rather
+than by a brittle per-topic count snapshot:
 
-**Total: 46 library unit + 2 IO unit + 13 runtime unit + 30 CLI unit + 31 Discord unit + 4 doc tests + 1 benchmark suite**
+- `gemini-live`
+  codec round-trips, event decomposition, audio encoding, session status and
+  resumed-handshake shaping, transport request construction, and hot-path
+  benchmarks.
+- `gemini-live-runtime`
+  staged setup patching, resumed vs fresh apply semantics, managed runtime
+  forwarding, generation filtering, process-local memory, and hot/dormant
+  session-manager behavior.
+- `gemini-live-harness`
+  durable task and notification storage, passive notification delivery,
+  profile-scoped storage helpers, tool-execution budgeting, controller
+  orchestration, and runtime-bridge forwarding.
+- `gemini-live-cli`
+  startup/profile resolution, CLI argument parsing, slash-command parsing and
+  completion, reducer behavior, render status, outbound send ordering, and tool
+  catalog/runtime composition.
+- `gemini-live-discord`
+  config parsing, routing policy, target-channel planning, runtime bootstrap,
+  service helper behavior, and current text/voice projection semantics.
+- `gemini-live-io`
+  desktop audio resample helpers.
+- Doc tests
+  `gemini-live` crate docs, including the `lib.rs` usage example and
+  `AudioEncoder` examples.
+
+The source of truth for exact test counts is the test modules themselves plus
+`cargo test --workspace --all-targets`; avoid keeping an exact count table here
+because it drifts whenever tests are added or reorganized.
 
 ## Running Tests
 
 ```bash
-# Unit tests (no network)
-cargo test
+# Checked-in tests and doc tests
+cargo test --workspace --all-targets
 
-# Integration tests (requires API key)
-GEMINI_API_KEY=xxx cargo test -- --ignored
-
-# Benchmarks (performance baselines are manual today)
+# Benchmarks (performance baselines are still manual today)
 cargo bench -p gemini-live
 ```
+
+There are no checked-in real-API integration tests yet. Those gaps are tracked
+in [`roadmap.md`](roadmap.md) items **T-1** through **T-6**.

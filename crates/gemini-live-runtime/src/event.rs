@@ -2,24 +2,16 @@
 //! raw `ServerEvent` alone.
 
 use gemini_live::ServerEvent;
+use gemini_live::types::FunctionCallRequest;
 
 /// Observable runtime events emitted by a host-managed runtime loop.
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     Lifecycle(RuntimeLifecycleEvent),
     Server(ServerEvent),
-    Lagged {
-        count: u64,
-    },
-    ToolCallStarted {
-        id: String,
-        name: String,
-    },
-    ToolCallFinished {
-        id: String,
-        name: String,
-        outcome: ToolCallOutcome,
-    },
+    Lagged { count: u64 },
+    ToolCallRequested { call: FunctionCallRequest },
+    ToolCallCancellationRequested { ids: Vec<String> },
     SendFailed(RuntimeSendFailure),
 }
 
@@ -32,14 +24,6 @@ pub enum RuntimeLifecycleEvent {
     AppliedResumedSession,
     AppliedFreshSession,
     Closed { reason: String },
-}
-
-/// The result of a tool-call attempt from the runtime's perspective.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolCallOutcome {
-    Responded,
-    Cancelled,
-    Failed { reason: String },
 }
 
 /// A send failure that hosts can render or log with product-specific wording.

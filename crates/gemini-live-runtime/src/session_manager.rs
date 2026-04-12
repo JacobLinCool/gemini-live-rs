@@ -1,4 +1,4 @@
-//! Higher-level session lifecycle skeleton above [`ManagedRuntime`](crate::ManagedRuntime).
+//! Higher-level session lifecycle skeleton above [`ManagedRuntime`].
 //!
 //! The managed runtime already owns active-session forwarding and tool-call
 //! request fanout. Hosts that want lower-power behavior still need one more
